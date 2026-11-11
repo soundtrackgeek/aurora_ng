@@ -4,6 +4,7 @@
 mod app;
 mod audio;
 mod covers;
+mod install;
 mod library;
 mod update;
 
@@ -37,6 +38,9 @@ impl AssetSource for Assets {
 }
 
 fn main() {
+    if install::run() {
+        return;
+    }
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(

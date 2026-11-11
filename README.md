@@ -4,7 +4,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.7.0** browses your library, shows a wall of album covers, plays music, and keeps itself up to date.
+Version **0.8.0** browses your library, shows a wall of album covers, plays music, and keeps itself up to date.
 
 ## What it does
 
@@ -18,7 +18,15 @@ Version **0.7.0** browses your library, shows a wall of album covers, plays musi
 
 ## Download
 
-Get `aurora_ng-windows-x64.exe` from the [latest release](https://github.com/soundtrackgeek/aurora_ng/releases/latest) and run it. There is no installer; the app updates itself in place.
+Get `aurora_ng-windows-x64.exe` from the [latest release](https://github.com/soundtrackgeek/aurora_ng/releases/latest) and run it. The download is its own installer: the first time it runs, it
+
+- copies itself to `%LOCALAPPDATA%\Programs\Aurora NG\Aurora NG.exe` (no admin rights needed),
+- adds **Aurora NG** to the Start Menu,
+- starts the installed copy and closes.
+
+Open it from the Start Menu from then on; right-click it there to **Pin to Start** or **Pin to taskbar**. The downloaded file can be deleted. Running the download again installs it over the old copy (close the app first). The app updates itself in place, so the Start Menu entry and pins keep working after updates.
+
+To uninstall, delete the `%LOCALAPPDATA%\Programs\Aurora NG` folder and the Start Menu shortcut (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Aurora NG.lnk`).
 
 ## Your library
 
@@ -56,7 +64,7 @@ The first build compiles GPUI and takes several minutes. Run the tests with `car
 
 ## App icon
 
-The icon (aurora curtains over a night sky, with a pair of music notes) is built into the exe, so Explorer, the Start Menu, the taskbar and the window all show it. `build.rs` embeds `assets/app-icon/aurora_ng.ico` together with the app's name and version, which Windows shows in the file's Properties and in Task Manager.
+The icon (aurora curtains over a night sky, with a pair of music notes) is built into the exe, so Explorer, the Start Menu, the taskbar and the window all show it, as does the Start Menu shortcut the app makes when it installs itself. `build.rs` embeds `assets/app-icon/aurora_ng.ico` together with the app's name and version, which Windows shows in the file's Properties and in Task Manager.
 
 The icon is drawn by a script. To change it, edit `assets/app-icon/generate.py` and run it from the repository root (needs Python with Pillow and numpy):
 

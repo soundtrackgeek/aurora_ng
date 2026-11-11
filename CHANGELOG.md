@@ -2,7 +2,13 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
-## [0.7.0] - 2026-11-11
+## [0.8.0] - 2026-11-11
+
+### Added
+
+- The app installs itself: the first time the downloaded `aurora_ng-windows-x64.exe` runs, it copies itself to `%LOCALAPPDATA%\Programs\Aurora NG\Aurora NG.exe`, adds an **Aurora NG** shortcut to the Start Menu, and starts from there. It now shows as "Aurora NG" in Start Menu search and can be pinned to Start and the taskbar. If the shortcut is removed, the installed app puts it back the next time it starts.
+
+ - 2026-11-11
 
 ### Added
 
