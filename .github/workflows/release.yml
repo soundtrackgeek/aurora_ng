@@ -25,10 +25,16 @@ jobs:
           fi
 
       # rustup installs the toolchain pinned in rust-toolchain.toml.
+      # GitHub only lets a tag run restore caches saved on master, so this
+      # reads the cache that ci.yml keeps warm and does not save its own.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+          save-if: false
 
+      # Release-mode tests share compiled dependencies with the build below.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --release --locked
 
       - name: Build
         run: cargo build --release --locked

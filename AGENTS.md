@@ -21,5 +21,6 @@
 4. **Release**: when the version number changed, tag the commit and push the tag to publish a GitHub Release (the in-app updater picks it up):
    - `git tag vX.Y.Z` (must match `version` in `Cargo.toml`)
    - `git push origin vX.Y.Z`
+   - Wait for the CI run on `master` for that commit to finish before pushing the tag, so the release reuses its build cache (a cold release build takes 30+ minutes).
 
 5. **Clean up**: after every push, run `cargo clean` to free the disk space used by `target/`.

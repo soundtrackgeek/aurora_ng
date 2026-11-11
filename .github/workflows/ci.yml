@@ -1,0 +1,27 @@
+# Builds and tests every push to master. It also keeps the build cache warm:
+# release runs (on tags) can only restore caches saved on master.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same key as release.yml, so releases reuse this cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # Release mode, like release.yml, so the cached dependencies match.
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked

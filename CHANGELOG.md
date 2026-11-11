@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.2.1] - 2026-11-11
+
+### Changed
+
+- Faster release builds: tests run in release mode so they share compiled dependencies with the build, and a new CI workflow builds and tests every push to `master`, keeping a cache that the release workflow reuses.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

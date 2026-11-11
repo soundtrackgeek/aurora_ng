@@ -2,7 +2,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.2.0** browses your library, plays music, and keeps itself up to date.
+Version **0.2.1** browses your library, plays music, and keeps itself up to date.
 
 ## What it does
 
@@ -41,9 +41,9 @@ The first build compiles GPUI and takes several minutes. Run the tests with `car
 
 ## Releasing
 
-Releases are built by GitHub Actions (`.github/workflows/release.yml`):
+Every push to `master` is built and tested by GitHub Actions (`.github/workflows/ci.yml`), which also keeps the build cache warm. Releases are built by `.github/workflows/release.yml`:
 
 1. Bump `version` in `Cargo.toml` and add the matching section to `CHANGELOG.md`.
-2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+2. Commit, then tag and push: `git tag v0.2.1 && git push origin v0.2.1`. Wait for the CI run on `master` to finish first, so the release can reuse its cache..
 
 The workflow checks that the tag matches `Cargo.toml`, runs the tests, builds the release exe and publishes it with that version's changelog notes. Running apps pick it up within 30 minutes.
