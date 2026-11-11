@@ -2,6 +2,14 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.12.0] - 2026-11-11
+
+### Added
+
+- Rate tracks with one to five whole stars by clicking the stars in the album details, the Tracks column or the now-playing bar; hovering previews the rating, and clicking a track's current rating clears it. Ctrl+1 to Ctrl+5 rate the selected (or playing) track and Ctrl+0 clears it. Half stars cannot be set.
+- As in Aurora, the rating is written into the MP3 as MusicBee's `POPM` frame, through a verified working copy and an atomic replace that keep every other tag and the audio unchanged. Music Library is then asked through its bridge to re-read the file, which updates the track's rating and the album's rating and Album Score in its catalog.
+- Ratings Music Library has not picked up yet keep showing, are saved in `%LOCALAPPDATA%\aurora_ng\pending-ratings.json`, and are handed to it again every 30 seconds and after a restart. The now-playing bar shows what ratings are doing.
+
 ## [0.11.0] - 2026-11-11
 
 ### Added

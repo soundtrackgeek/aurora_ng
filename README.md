@@ -4,7 +4,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.11.0** browses and searches your library, shows a wall of album covers, plays music, and keeps itself up to date.
+Version **0.12.0** browses and searches your library, shows a wall of album covers, plays music, rates tracks, and keeps itself up to date.
 
 ## What it does
 
@@ -33,6 +33,11 @@ Version **0.11.0** browses and searches your library, shows a wall of album cove
   | `sort:az` / `sort:za` | Short for `sort:album az` / `sort:album za` |
 
   Without `az` or `za`, `sort:album` and `sort:aartist` sort A–Z. Albums in the same year are ordered by artist, then title; albums with the same title by artist, then year. The shuffled order is remembered, so the app opens with the same draw after a restart.
+- **Rate tracks**: click a star next to a track to give it one to five stars: in the album's details on the cover wall, in the **Tracks** column, or next to the playing track in the now-playing bar. Hovering shows the rating a click will give. Clicking the stars a track already has clears its rating. **Ctrl+1** to **Ctrl+5** rate the selected track (or the playing one when no track is selected), and **Ctrl+0** clears it. Ratings are always whole stars; half stars set in other programs are still shown. Rating works the way it does in Aurora:
+  1. The rating is written into the MP3 itself, as the `POPM` frame MusicBee and Aurora use (owner `MusicBee`; 1★ = 1, 2★ = 64, 3★ = 128, 4★ = 196, 5★ = 255). An old Windows-style `Default` rating frame is replaced; other players' rating frames and every other tag are kept. The new tag goes into a hidden working copy next to the MP3, which is checked (the rating reads back, every other tag and the audio itself are unchanged) and then swapped in with one atomic replace, so the MP3 is never left half written.
+  2. Music Library is then asked to read that one file again, through the same bridge Aurora uses (`music-library.exe --aurora-bridge`). It updates its catalog: the track's rating, and the album's rating and Album Score, which the app then shows. Aurora NG still never writes the catalog itself.
+
+  The new rating shows right away. When Music Library can't be reached or is busy, the rating stays in the MP3 and in `%LOCALAPPDATA%\aurora_ng\pending-ratings.json`, keeps showing, and is handed to Music Library again every 30 seconds, also after a restart; the now-playing bar says how many are waiting. Only MP3s can be rated. Music Library must be installed in `%LOCALAPPDATA%\Music Library` (or set `AURORA_MUSIC_LIBRARY_EXE` to its `music-library.exe`, as for Aurora).
 - **Find an artist**: start typing a name anywhere in the window ("pink f") to jump to the first matching artist (not while typing in the search box).
 - **Play**: double-click an album to play it from the start, or double-click a track to play the album from that track. The album plays through to the end.
 - **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds.
@@ -59,7 +64,7 @@ Aurora NG reads the same catalog as Aurora: Music Library's database at
 %APPDATA%\com.local.musiclibrary\music-library.sqlite3
 ```
 
-It opens the catalog read-only and never changes it. Music Library must have imported your music first. To use a catalog somewhere else, set the `AURORA_NG_CATALOG` environment variable to its full path before starting the app.
+It opens the catalog read-only and never changes it; when you rate a track, Music Library updates the catalog (see **Rate tracks**). Music Library must have imported your music first. To use a catalog somewhere else, set the `AURORA_NG_CATALOG` environment variable to its full path before starting the app.
 
 ## Album covers
 

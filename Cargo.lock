@@ -445,11 +445,12 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurora_ng"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "embed-resource",
  "gpui",
+ "id3",
  "image",
  "rodio",
  "rusqlite",
@@ -457,6 +458,8 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "ureq",
  "windows 0.61.3",
 ]
@@ -2819,6 +2822,17 @@ dependencies = [
  "zerofrom",
  "zerotrie",
  "zerovec",
+]
+
+[[package]]
+name = "id3"
+version = "1.17.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cf1819f31542d9f81db9caa644f91bcf8a375f6de0ce649e4596778b955ab7"
+dependencies = [
+ "bitflags 2.13.2",
+ "byteorder",
+ "flate2",
 ]
 
 [[package]]

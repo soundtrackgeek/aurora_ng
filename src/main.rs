@@ -4,8 +4,11 @@
 mod app;
 mod audio;
 mod covers;
+mod id3_write;
 mod install;
 mod library;
+mod music_library;
+mod rating;
 mod search;
 mod settings;
 mod text_input;

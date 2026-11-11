@@ -5,6 +5,8 @@ use crate::{
     audio::Audio,
     covers::{self, CoverIndex},
     library::{Album, Artist, Catalog, Track, catalog_path},
+    music_library,
+    rating::{self, PendingRating, Stars},
     search,
     settings::{self, SavedWindow, Settings},
     text_input::{InputEvent, TextInput},
@@ -20,9 +22,9 @@ use gpui::{
 use rusqlite::InterruptHandle;
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -50,6 +52,12 @@ const TILE_TEXT_HEIGHT: Pixels = px(52.);
 const TILE_INFO_HEIGHT: Pixels = px(44.);
 /// Memory for thumbnails; the ones off screen longest are dropped past this.
 const COVER_MEMORY_BYTES: usize = 192 * 1024 * 1024;
+/// How long to wait before giving Music Library a rating again, when it was
+/// busy, and when it turned the file down.
+const RATING_SYNC_RETRY: Duration = Duration::from_secs(30);
+const RATING_SYNC_RETRY_AFTER_ERROR: Duration = Duration::from_secs(10 * 60);
+/// How long "Rating saved" and the like stay in the now-playing bar.
+const RATING_STATUS_TIME: Duration = Duration::from_secs(6);
 
 actions!(aurora, [FocusSearch]);
 
@@ -99,6 +107,26 @@ enum LoadState {
     Loading,
     Ready,
     Failed(String),
+}
+
+/// Work on a rating, done in the background one at a time, in order.
+#[derive(Clone)]
+enum RatingJob {
+    /// Write the rating into the MP3.
+    Save {
+        path: PathBuf,
+        album_id: String,
+        title: String,
+        stars: Option<Stars>,
+    },
+    /// Have Music Library read an MP3 whose rating was saved.
+    Sync { path: PathBuf, album_id: String },
+}
+
+struct RatingStatus {
+    text: String,
+    error: bool,
+    at: Instant,
 }
 
 struct Loaded {
@@ -218,6 +246,20 @@ pub struct AuroraApp {
     restore: Settings,
     /// Where the window is, kept so the settings can be saved without it.
     window_bounds: Option<WindowBounds>,
+
+    /// Ratings waiting their turn, oldest first.
+    rating_jobs: VecDeque<RatingJob>,
+    /// The rating job running now; dropping the task does not stop it.
+    rating_running: Option<(RatingJob, Task<()>)>,
+    /// Ratings saved in MP3s that Music Library has not read yet; they are
+    /// shown instead of the catalog's until it has.
+    pending_ratings: Vec<PendingRating>,
+    /// When to hand the pending ratings to Music Library again.
+    next_rating_sync: Instant,
+    rating_status: Option<RatingStatus>,
+    /// The star under the mouse, to preview the rating it gives: where the
+    /// stars are, the track id, and the star.
+    star_hover: Option<(&'static str, i64, u8)>,
 }
 
 impl AuroraApp {
@@ -353,6 +395,13 @@ impl AuroraApp {
             _update_checker: update_checker,
             restore: settings,
             window_bounds: None,
+            rating_jobs: VecDeque::new(),
+            rating_running: None,
+            pending_ratings: rating::load_pending(),
+            // Ratings left from last time go to Music Library once the app is up.
+            next_rating_sync: Instant::now() + Duration::from_secs(5),
+            rating_status: None,
+            star_hover: None,
         }
     }
 
@@ -766,7 +815,10 @@ impl AuroraApp {
         };
         self.selected_album = Some(ix);
         match catalog.tracks(&album.id) {
-            Ok(tracks) => self.tracks = tracks,
+            Ok(mut tracks) => {
+                self.apply_known_ratings(&mut tracks);
+                self.tracks = tracks;
+            }
             Err(error) => self.tracks_error = Some(error),
         }
         cx.notify();
@@ -1225,6 +1277,7 @@ impl AuroraApp {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
+        self.tick_ratings(cx);
         let (Ok(audio), Some(ix)) = (&self.audio, self.current) else {
             return;
         };
@@ -1248,6 +1301,17 @@ impl AuroraApp {
         }
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
+        // Ctrl+1 to Ctrl+5 rate the selected track, Ctrl+0 clears its rating.
+        if modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.platform
+            && let Some(digit) = keystroke.key.parse::<u8>().ok().filter(|digit| *digit <= 5)
+        {
+            self.rate_with_key(Stars::new(digit), cx);
+            cx.stop_propagation();
+            return;
+        }
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
             return;
         }
@@ -1281,6 +1345,337 @@ impl AuroraApp {
         self.type_ahead_at = Instant::now();
         self.jump_to_artist(cx);
         cx.stop_propagation();
+    }
+
+    // ── Ratings ─────────────────────────────────────────────────────────
+    //
+    // As in Aurora: the rating goes into the MP3 first, then Music Library
+    // is asked to read the file again, which updates its catalog. The new
+    // rating shows at once and stays shown until the catalog has it.
+
+    /// Rates a track with whole stars, or clears its rating with `None`.
+    fn rate(&mut self, track: &Track, stars: Option<Stars>, cx: &mut Context<Self>) {
+        self.show_rating(&track.path, stars.map(Stars::points));
+        let job = RatingJob::Save {
+            path: track.path.clone(),
+            album_id: track.album_id.clone(),
+            title: track.title.clone(),
+            stars,
+        };
+        // A newer rating replaces one for the same track still waiting.
+        let waiting = self
+            .rating_jobs
+            .iter_mut()
+            .find(|waiting| matches!(waiting, RatingJob::Save { path, .. } if *path == track.path));
+        match waiting {
+            Some(waiting) => *waiting = job,
+            None => self.rating_jobs.push_back(job),
+        }
+        self.rating_status = None;
+        self.run_rating_job(cx);
+        cx.notify();
+    }
+
+    /// Ctrl+0–5: rates the selected track, or the one playing when no track
+    /// is selected.
+    fn rate_with_key(&mut self, stars: Option<Stars>, cx: &mut Context<Self>) {
+        let track = self
+            .selected_track
+            .and_then(|ix| self.tracks.get(ix))
+            .or_else(|| self.current_track())
+            .cloned();
+        if let Some(track) = track {
+            self.rate(&track, stars, cx);
+        }
+    }
+
+    /// Shows a rating on the track in the album and in what is playing.
+    fn show_rating(&mut self, path: &Path, rating: Option<i64>) {
+        for track in self.tracks.iter_mut().chain(self.queue.iter_mut()) {
+            if track.path == path {
+                track.rating = rating;
+            }
+        }
+    }
+
+    /// The rating a track has that the catalog may not show yet: one being
+    /// saved, or saved and waiting for Music Library.
+    fn known_rating(&self, path: &Path) -> Option<Option<i64>> {
+        let saving = self
+            .rating_jobs
+            .iter()
+            .rev()
+            .chain(self.rating_running.as_ref().map(|(job, _)| job))
+            .find_map(|job| match job {
+                RatingJob::Save {
+                    path: saving,
+                    stars,
+                    ..
+                } if saving == path => Some(stars.map(Stars::points)),
+                _ => None,
+            });
+        saving.or_else(|| {
+            self.pending_ratings
+                .iter()
+                .find(|pending| pending.path == path)
+                .map(|pending| pending.rating)
+        })
+    }
+
+    fn apply_known_ratings(&self, tracks: &mut [Track]) {
+        for track in tracks {
+            if let Some(rating) = self.known_rating(&track.path) {
+                track.rating = rating;
+            }
+        }
+    }
+
+    /// Starts the next rating job, unless one is running.
+    fn run_rating_job(&mut self, cx: &mut Context<Self>) {
+        if self.rating_running.is_some() {
+            return;
+        }
+        let Some(job) = self.rating_jobs.pop_front() else {
+            return;
+        };
+        let work = {
+            let job = job.clone();
+            cx.background_executor().spawn(async move {
+                match job {
+                    RatingJob::Save { path, stars, .. } => rating::write_rating(&path, stars),
+                    RatingJob::Sync { path, .. } => music_library::sync_file(&path),
+                }
+            })
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| this.finish_rating_job(result, cx))
+                .ok();
+        });
+        self.rating_running = Some((job, task));
+    }
+
+    fn finish_rating_job(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        let Some((job, _)) = self.rating_running.take() else {
+            return;
+        };
+        match (job, result) {
+            (
+                RatingJob::Save {
+                    path,
+                    album_id,
+                    stars,
+                    ..
+                },
+                Ok(()),
+            ) => {
+                self.pending_ratings.retain(|pending| pending.path != path);
+                self.pending_ratings.push(PendingRating {
+                    path: path.clone(),
+                    album_id: album_id.clone(),
+                    rating: stars.map(Stars::points),
+                });
+                rating::save_pending(&self.pending_ratings);
+                // Music Library reads it next, before any other rating.
+                self.rating_jobs
+                    .push_front(RatingJob::Sync { path, album_id });
+            }
+            (
+                RatingJob::Save {
+                    album_id, title, ..
+                },
+                Err(error),
+            ) => {
+                self.set_rating_status(format!("Could not rate “{title}”: {error}"), true);
+                // Back to the rating the MP3 has.
+                self.refresh_album(&album_id);
+            }
+            (RatingJob::Sync { path, album_id }, Ok(())) => {
+                self.pending_ratings.retain(|pending| pending.path != path);
+                rating::save_pending(&self.pending_ratings);
+                self.refresh_album(&album_id);
+                if self.rating_jobs.is_empty() {
+                    self.set_rating_status("Rating saved".to_owned(), false);
+                }
+            }
+            (RatingJob::Sync { .. }, Err(error)) => {
+                // The others would most likely fail the same way; they stay
+                // pending and are tried again later.
+                self.rating_jobs
+                    .retain(|job| !matches!(job, RatingJob::Sync { .. }));
+                let temporary = music_library::is_temporary(&error);
+                self.next_rating_sync = Instant::now()
+                    + if temporary {
+                        RATING_SYNC_RETRY
+                    } else {
+                        RATING_SYNC_RETRY_AFTER_ERROR
+                    };
+                self.set_rating_status(
+                    format!(
+                        "The rating is saved in the MP3; Music Library will be given it again soon. {error}"
+                    ),
+                    !temporary,
+                );
+            }
+        }
+        self.run_rating_job(cx);
+        cx.notify();
+    }
+
+    fn set_rating_status(&mut self, text: String, error: bool) {
+        self.rating_status = Some(RatingStatus {
+            text,
+            error,
+            at: Instant::now(),
+        });
+    }
+
+    /// Hands pending ratings to Music Library again when it is time, and
+    /// clears a status message that has been shown long enough.
+    fn tick_ratings(&mut self, cx: &mut Context<Self>) {
+        if self
+            .rating_status
+            .as_ref()
+            .is_some_and(|status| !status.error && status.at.elapsed() > RATING_STATUS_TIME)
+        {
+            self.rating_status = None;
+            cx.notify();
+        }
+        let idle = self.rating_running.is_none() && self.rating_jobs.is_empty();
+        if !idle || self.pending_ratings.is_empty() || Instant::now() < self.next_rating_sync {
+            return;
+        }
+        self.next_rating_sync = Instant::now() + RATING_SYNC_RETRY;
+        self.rating_jobs
+            .extend(self.pending_ratings.iter().map(|pending| RatingJob::Sync {
+                path: pending.path.clone(),
+                album_id: pending.album_id.clone(),
+            }));
+        self.run_rating_job(cx);
+        cx.notify();
+    }
+
+    /// Reads an album's track ratings, its rating and its Album Score from the
+    /// catalog again, where they are shown.
+    fn refresh_album(&mut self, album_id: &str) {
+        let Some(catalog) = &self.catalog else {
+            return;
+        };
+        let Ok(mut fresh) = catalog.tracks(album_id) else {
+            return;
+        };
+        let album_rating = catalog.album_rating(album_id);
+        self.apply_known_ratings(&mut fresh);
+        for track in self.tracks.iter_mut().chain(self.queue.iter_mut()) {
+            if let Some(fresh) = fresh.iter().find(|fresh| fresh.path == track.path) {
+                track.rating = fresh.rating;
+            }
+        }
+        if let Ok((rating, score)) = album_rating {
+            for album in self
+                .library
+                .iter_mut()
+                .chain(self.artists.iter_mut())
+                .flat_map(|artist| artist.albums.iter_mut())
+                .filter(|album| album.id == album_id)
+            {
+                album.rating = rating;
+                album.score = score;
+            }
+        }
+    }
+
+    /// Five stars to click. A star gives the track that many stars; clicking
+    /// the stars it already has clears its rating. Never half stars.
+    fn rating_control(
+        &self,
+        place: &'static str,
+        track: &Track,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let size = px(13.);
+        let id = track.id;
+        let hovered = self
+            .star_hover
+            .filter(|(hover_place, track, _)| *hover_place == place && *track == id)
+            .map(|(_, _, star)| star);
+        let halves = match hovered {
+            Some(star) => i64::from(star) * 2,
+            None => star_halves(track.rating),
+        };
+        div()
+            .id(place)
+            .flex()
+            .items_center()
+            .children((1..=5u8).map(|star| {
+                let filled = (halves - i64::from(star - 1) * 2).clamp(0, 2);
+                let target = track.clone();
+                div()
+                    .id(star as usize)
+                    .px(px(1.))
+                    .py_1()
+                    .cursor_pointer()
+                    .child(star_slot(filled, size, color::STAR))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.star_hover = Some((place, id, star));
+                        } else if this.star_hover == Some((place, id, star)) {
+                            this.star_hover = None;
+                        } else {
+                            return;
+                        }
+                        cx.notify();
+                    }))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        // The click is for the stars, not for the row under them.
+                        cx.stop_propagation();
+                        let stars = if target.rating == Some(i64::from(star) * 20) {
+                            None
+                        } else {
+                            Stars::new(star)
+                        };
+                        this.rate(&target, stars, cx);
+                    }))
+            }))
+    }
+
+    /// What ratings are doing, for the now-playing bar.
+    fn rating_status_line(&self) -> Option<(String, u32)> {
+        if self.rating_running.is_some() || !self.rating_jobs.is_empty() {
+            let saving = self
+                .rating_jobs
+                .iter()
+                .chain(self.rating_running.as_ref().map(|(job, _)| job))
+                .any(|job| matches!(job, RatingJob::Save { .. }));
+            return Some((
+                if saving {
+                    "Saving rating…"
+                } else {
+                    "Updating Music Library…"
+                }
+                .to_owned(),
+                color::MUTED,
+            ));
+        }
+        if let Some(status) = &self.rating_status {
+            let color = if status.error {
+                color::ERROR
+            } else {
+                color::MUTED
+            };
+            return Some((status.text.clone(), color));
+        }
+        match self.pending_ratings.len() {
+            0 => None,
+            1 => Some((
+                "1 rating waiting for Music Library".to_owned(),
+                color::MUTED,
+            )),
+            count => Some((
+                format!("{count} ratings waiting for Music Library"),
+                color::MUTED,
+            )),
+        }
     }
 
     // ── Rendering ───────────────────────────────────────────────────────
@@ -1543,6 +1938,7 @@ impl AuroraApp {
                                 )
                             })
                             .child(muted(track.duration_seconds.map(clock).unwrap_or_default()))
+                            .child(this.rating_control("list", track, cx))
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 this.selected_track = Some(ix);
                                 if event.click_count() >= 2 {
@@ -1955,7 +2351,7 @@ impl AuroraApp {
                             .text_xs()
                             .text_color(rgb(color::MUTED))
                             .child(track.duration_seconds.map(clock).unwrap_or_default()),
-                        div().child(stars(track.rating, px(13.))),
+                        div().child(self.rating_control("details", track, cx)),
                         div().child(heart(track.loved, px(14.))),
                     ],
                 )
@@ -2054,8 +2450,10 @@ impl AuroraApp {
                 .child(error.clone()),
             (Some(track), _, _) => div()
                 .flex()
+                .items_center()
                 .gap_2()
                 .min_w_0()
+                .child(self.rating_control("playing", track, cx))
                 .child(
                     div()
                         .flex_none()
@@ -2168,6 +2566,17 @@ impl AuroraApp {
                             .child(div().w(px(44.)).child(clock(total))),
                     ),
             )
+            .when_some(self.rating_status_line(), |bar, (text, text_color)| {
+                bar.child(
+                    div()
+                        .flex_none()
+                        .max_w(px(360.))
+                        .text_xs()
+                        .text_color(rgb(text_color))
+                        .line_clamp(2)
+                        .child(text),
+                )
+            })
     }
 }
 
@@ -2360,6 +2769,16 @@ fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) 
 /// five are empty when there is no rating.
 fn stars(rating: Option<i64>, size: Pixels) -> Div {
     let halves = star_halves(rating);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .children((0..5).map(|star| star_slot((halves - star * 2).clamp(0, 2), size, color::STAR)))
+}
+
+/// One star with 0, 1 or 2 of its halves filled in. Ratings set in other
+/// programs can have half stars, so they are shown; they are never set here.
+fn star_slot(filled: i64, size: Pixels, fill: u32) -> Div {
     let icon = move |color: u32| {
         svg()
             .path("icons/star.svg")
@@ -2367,30 +2786,23 @@ fn stars(rating: Option<i64>, size: Pixels) -> Div {
             .text_color(rgb(color))
     };
     div()
-        .flex()
-        .items_center()
-        .gap(px(2.))
-        .children((0..5).map(|star| {
-            let filled = (halves - star * 2).clamp(0, 2);
-            div()
-                .relative()
-                .size(size)
-                .flex_none()
-                .child(icon(color::UNSET))
-                .when(filled > 0, |slot| {
-                    // A half star is a full one, clipped to its left half.
-                    slot.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .h(size)
-                            .w(if filled == 2 { size } else { size / 2. })
-                            .overflow_hidden()
-                            .child(icon(color::STAR)),
-                    )
-                })
-        }))
+        .relative()
+        .size(size)
+        .flex_none()
+        .child(icon(color::UNSET))
+        .when(filled > 0, |slot| {
+            // A half star is a full one, clipped to its left half.
+            slot.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h(size)
+                    .w(if filled == 2 { size } else { size / 2. })
+                    .overflow_hidden()
+                    .child(icon(fill)),
+            )
+        })
 }
 
 /// 0–100 → half stars, 0 to 10.

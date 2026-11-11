@@ -54,12 +54,13 @@ pub struct SavedWindow {
     pub maximized: bool,
 }
 
+/// `%LOCALAPPDATA%\aurora_ng`, where the app keeps its own files.
+pub fn data_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("aurora_ng"))
+}
+
 fn settings_path() -> Option<PathBuf> {
-    Some(
-        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-            .join("aurora_ng")
-            .join("settings.json"),
-    )
+    Some(data_dir()?.join("settings.json"))
 }
 
 impl Settings {

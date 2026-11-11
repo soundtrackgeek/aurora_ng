@@ -39,6 +39,7 @@ pub struct Artist {
 #[derive(Clone)]
 pub struct Track {
     pub id: i64,
+    pub album_id: String,
     pub title: String,
     pub artist: String,
     pub disc: Option<i64>,
@@ -213,6 +214,7 @@ impl Catalog {
                 let filename: String = row.get(7)?;
                 Ok(Track {
                     id: row.get(0)?,
+                    album_id: album_id.to_owned(),
                     title: non_empty(row.get(1)?).unwrap_or_else(|| filename.clone()),
                     artist: non_empty(row.get(2)?).unwrap_or_else(|| "Unknown Artist".to_owned()),
                     disc: row.get(3)?,
@@ -226,6 +228,20 @@ impl Catalog {
             .map_err(|error| format!("Could not read tracks: {error}"))?
             .collect::<Result<_, _>>()
             .map_err(|error| format!("Could not read a track: {error}"))
+    }
+}
+
+impl Catalog {
+    /// An album's rating (0–100) and Album Score, which Music Library works
+    /// out again when a track's rating changes.
+    pub fn album_rating(&self, album_id: &str) -> Result<(Option<i64>, Option<f64>), String> {
+        self.connection
+            .query_row(
+                "SELECT effective_album_rating, album_score FROM albums WHERE id = ?1",
+                [album_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("Could not read the album's rating: {error}"))
     }
 }
 
