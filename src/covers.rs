@@ -12,8 +12,17 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-/// Thumbnails are square, this many pixels on each side.
-pub const THUMBNAIL_PX: u32 = 320;
+/// Thumbnails are square and come in these sizes, in pixels per side. The
+/// wall uses the smallest one at least as big as a tile on screen.
+pub const THUMBNAIL_SIZES: [u32; 4] = [128, 256, 512, 1024];
+
+/// The thumbnail size for a tile this many screen pixels wide.
+pub fn thumbnail_size(tile_px: f32) -> u32 {
+    THUMBNAIL_SIZES
+        .into_iter()
+        .find(|&size| size as f32 >= tile_px)
+        .unwrap_or(THUMBNAIL_SIZES[THUMBNAIL_SIZES.len() - 1])
+}
 
 /// `C:\_code\music_backup_v5\AlbumCovers`, unless `AURORA_NG_COVERS` points somewhere else.
 pub fn covers_dir() -> PathBuf {
@@ -74,14 +83,18 @@ impl CoverIndex {
     }
 }
 
-/// A square thumbnail of `cover`, ready to draw. Reuses the copy saved in
+/// A square thumbnail of `cover`, `size` pixels per side, ready to draw. Reuses the copy saved in
 /// `cache_dir` when there is one, and saves a new one otherwise.
-pub fn thumbnail(cover: &Path, cache_dir: Option<&Path>) -> Result<Arc<RenderImage>, String> {
-    let cached = cache_dir.and_then(|dir| Some(dir.join(cache_name(cover)?)));
+pub fn thumbnail(
+    cover: &Path,
+    size: u32,
+    cache_dir: Option<&Path>,
+) -> Result<Arc<RenderImage>, String> {
+    let cached = cache_dir.and_then(|dir| Some(dir.join(cache_name(cover, size)?)));
     let pixels = match cached.as_deref().and_then(|path| image::open(path).ok()) {
         Some(image) => image.into_rgba8(),
         None => {
-            let image = make_thumbnail(cover)?;
+            let image = make_thumbnail(cover, size)?;
             if let Some(path) = &cached {
                 save_jpeg(&image, path);
             }
@@ -91,7 +104,7 @@ pub fn thumbnail(cover: &Path, cache_dir: Option<&Path>) -> Result<Arc<RenderIma
     Ok(Arc::new(render_image(pixels)))
 }
 
-fn make_thumbnail(cover: &Path) -> Result<DynamicImage, String> {
+fn make_thumbnail(cover: &Path, size: u32) -> Result<DynamicImage, String> {
     let image = ImageReader::open(cover)
         .and_then(|reader| reader.with_guessed_format())
         .map_err(|error| format!("Could not open {}: {error}", cover.display()))?
@@ -105,8 +118,8 @@ fn make_thumbnail(cover: &Path) -> Result<DynamicImage, String> {
         side,
         side,
     );
-    Ok(if side > THUMBNAIL_PX {
-        square.thumbnail(THUMBNAIL_PX, THUMBNAIL_PX)
+    Ok(if side > size {
+        square.thumbnail(size, size)
     } else {
         square
     })
@@ -126,7 +139,7 @@ fn save_jpeg(image: &DynamicImage, path: &Path) {
 
 /// Named after the cover's path, size and modified time, so replacing a
 /// cover makes a new thumbnail.
-fn cache_name(cover: &Path) -> Option<String> {
+fn cache_name(cover: &Path, size: u32) -> Option<String> {
     let metadata = fs::metadata(cover).ok()?;
     let modified = metadata
         .modified()
@@ -135,7 +148,7 @@ fn cache_name(cover: &Path) -> Option<String> {
         .ok()?
         .as_secs();
     let key = format!(
-        "{}|{}|{modified}|{THUMBNAIL_PX}",
+        "{}|{}|{modified}|{size}",
         cover.to_string_lossy().to_lowercase(),
         metadata.len()
     );
@@ -186,6 +199,15 @@ mod tests {
             Some(PathBuf::from("Kittie - Oracle (2001).jpg"))
         );
         assert_eq!(covers.find(r"D:\MUSIC\Kittie - Spit (1999)"), None);
+    }
+
+    #[test]
+    fn picks_the_smallest_thumbnail_that_fits() {
+        assert_eq!(thumbnail_size(50.), 128);
+        assert_eq!(thumbnail_size(128.), 128);
+        assert_eq!(thumbnail_size(270.), 512);
+        assert_eq!(thumbnail_size(1000.), 1024);
+        assert_eq!(thumbnail_size(1500.), 1024);
     }
 
     #[test]

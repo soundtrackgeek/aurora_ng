@@ -9,9 +9,9 @@ use crate::{
 };
 use gpui::{
     Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
-    MouseDownEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy, SharedString, Stateful, Task,
-    UniformListScrollHandle, Window, canvas, div, img, prelude::*, px, relative, rgb, svg,
-    uniform_list,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy,
+    SharedString, Stateful, Task, UniformListScrollHandle, Window, canvas, div, img, prelude::*,
+    px, relative, rgb, svg, uniform_list,
 };
 use std::{
     cell::Cell,
@@ -28,13 +28,16 @@ const TICK: Duration = Duration::from_millis(250);
 /// Keystrokes this close together build one search, like "pink f".
 const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(1000);
 
-/// Cover wall tiles: the square cover, then two lines of text.
-const TILE: Pixels = px(180.);
-const TILE_GAP: Pixels = px(18.);
-/// Top padding, cover, and room for the title and artist lines.
-const TILE_ROW_HEIGHT: Pixels = px(18. + 180. + 52.);
-/// Thumbnails kept in memory; older ones are dropped and reloaded when needed.
-const COVERS_IN_MEMORY: usize = 300;
+/// Cover wall tiles: the square cover, then two lines of text when there is room.
+const TILE_MIN: f32 = 50.;
+const TILE_MAX: f32 = 500.;
+const TILE_DEFAULT: f32 = 180.;
+/// Tiles narrower than this show only the cover.
+const TILE_MIN_FOR_TEXT: f32 = 100.;
+/// Room for the title and artist lines under a cover.
+const TILE_TEXT_HEIGHT: Pixels = px(52.);
+/// Memory for thumbnails; the ones off screen longest are dropped past this.
+const COVER_MEMORY_BYTES: usize = 192 * 1024 * 1024;
 
 mod color {
     pub const BACKGROUND: u32 = 0x0e1016;
@@ -78,9 +81,12 @@ enum Cover {
     Loading {
         _task: Task<()>,
         wanted: u64,
+        /// A smaller thumbnail to show until the new one is ready.
+        previous: Option<Arc<RenderImage>>,
     },
     Ready {
         image: Arc<RenderImage>,
+        size: u32,
         used: u64,
     },
     Missing,
@@ -102,6 +108,13 @@ pub struct AuroraApp {
     cover_wall: bool,
     wall_scroll: UniformListScrollHandle,
     wall_columns: usize,
+    wall_row_height: Pixels,
+    /// Cover width in pixels, set with the slider.
+    tile_size: f32,
+    /// The thumbnail size the wall is drawn with, from the tile size.
+    thumbnail_size: u32,
+    dragging_size: bool,
+    size_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Counts renders, to tell which covers are still on screen.
     wall_frame: u64,
     covers: HashMap<usize, Cover>,
@@ -200,6 +213,11 @@ impl AuroraApp {
             cover_wall: false,
             wall_scroll: UniformListScrollHandle::new(),
             wall_columns: 1,
+            wall_row_height: px(0.),
+            tile_size: TILE_DEFAULT,
+            thumbnail_size: covers::THUMBNAIL_SIZES[0],
+            dragging_size: false,
+            size_slider_bounds: Rc::new(Cell::new(Bounds::default())),
             wall_frame: 0,
             covers: HashMap::new(),
             thumbnail_dir: covers::thumbnail_dir(),
@@ -348,18 +366,29 @@ impl AuroraApp {
     /// `Some(None)` when the album has no cover. Starts a job if needed.
     fn cover(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<Option<Arc<RenderImage>>> {
         let frame = self.wall_frame;
-        match self.covers.get_mut(&ix) {
-            Some(Cover::Ready { image, used }) => {
+        let size = self.thumbnail_size;
+        let previous = match self.covers.get_mut(&ix) {
+            Some(Cover::Ready {
+                image,
+                size: ready_size,
+                used,
+            }) => {
                 *used = frame;
-                return Some(Some(image.clone()));
+                if *ready_size >= size {
+                    return Some(Some(image.clone()));
+                }
+                // Too small for the tile now: load a bigger one, showing this meanwhile.
+                Some(image.clone())
             }
-            Some(Cover::Loading { wanted, .. }) => {
+            Some(Cover::Loading {
+                wanted, previous, ..
+            }) => {
                 *wanted = frame;
-                return None;
+                return previous.clone().map(Some);
             }
             Some(Cover::Missing) => return Some(None),
-            None => {}
-        }
+            None => None,
+        };
         let (artist, album) = self.wall_album(ix);
         let Some(path) = self.artists[artist].albums[album].cover.clone() else {
             self.covers.insert(ix, Cover::Missing);
@@ -368,53 +397,69 @@ impl AuroraApp {
         let cache = self.thumbnail_dir.clone();
         let job = cx
             .background_executor()
-            .spawn(async move { covers::thumbnail(&path, cache.as_deref()) });
+            .spawn(async move { covers::thumbnail(&path, size, cache.as_deref()) });
         let task = cx.spawn(async move |this, cx| {
             let result = job.await;
-            this.update(cx, |this, cx| this.finish_cover(ix, result, cx))
+            this.update(cx, |this, cx| this.finish_cover(ix, size, result, cx))
                 .ok();
         });
+        let shown = previous.clone().map(Some);
         self.covers.insert(
             ix,
             Cover::Loading {
                 _task: task,
                 wanted: frame,
+                previous,
             },
         );
-        None
+        shown
     }
 
     fn finish_cover(
         &mut self,
         ix: usize,
+        size: u32,
         result: Result<Arc<RenderImage>, String>,
         cx: &mut Context<Self>,
     ) {
         let cover = match result {
             Ok(image) => Cover::Ready {
                 image,
+                size,
                 used: self.wall_frame,
             },
             Err(_) => Cover::Missing,
         };
-        self.covers.insert(ix, cover);
+        if let Some(Cover::Loading {
+            previous: Some(image),
+            ..
+        }) = self.covers.insert(ix, cover)
+        {
+            self.stale_images.push(image);
+        }
 
-        // Over the limit: drop the covers that have been off screen longest,
-        // plus some headroom so this does not run for every new cover.
-        let mut ready: Vec<(u64, usize)> = self
+        // Over budget: drop the covers that have been off screen longest, down
+        // to three quarters of the budget so this does not run for every cover.
+        // Covers on screen are always kept.
+        let bytes = |size: u32| size as usize * size as usize * 4;
+        let mut ready: Vec<(u64, usize, usize)> = self
             .covers
             .iter()
             .filter_map(|(&ix, cover)| match cover {
-                Cover::Ready { used, .. } => Some((*used, ix)),
+                Cover::Ready { used, size, .. } => Some((*used, ix, bytes(*size))),
                 _ => None,
             })
             .collect();
-        if ready.len() > COVERS_IN_MEMORY {
+        let mut total: usize = ready.iter().map(|(_, _, bytes)| bytes).sum();
+        if total > COVER_MEMORY_BYTES {
             ready.sort_unstable();
-            let excess = ready.len() - COVERS_IN_MEMORY + COVERS_IN_MEMORY / 4;
-            for (_, ix) in ready.into_iter().take(excess) {
+            for (used, ix, bytes) in ready {
+                if total <= COVER_MEMORY_BYTES / 4 * 3 || used >= self.wall_frame {
+                    break;
+                }
                 if let Some(Cover::Ready { image, .. }) = self.covers.remove(&ix) {
                     self.stale_images.push(image);
+                    total -= bytes;
                 }
             }
         }
@@ -425,12 +470,34 @@ impl AuroraApp {
     /// frees the GPU copies of dropped thumbnails.
     fn tidy_covers(&mut self, window: &mut Window) {
         let frame = self.wall_frame;
-        self.covers
-            .retain(|_, cover| !matches!(cover, Cover::Loading { wanted, .. } if *wanted < frame));
+        let stale = &mut self.stale_images;
+        self.covers.retain(|_, cover| match cover {
+            Cover::Loading {
+                wanted, previous, ..
+            } if *wanted < frame => {
+                stale.extend(previous.take());
+                false
+            }
+            _ => true,
+        });
         for image in self.stale_images.drain(..) {
             window.drop_image(image).ok();
         }
         self.wall_frame += 1;
+    }
+
+    /// Sets the cover size from a point on the size slider.
+    fn drag_size_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let bounds = self.size_slider_bounds.get();
+        if bounds.size.width <= px(0.) {
+            return;
+        }
+        let fraction = ((x - bounds.origin.x) / bounds.size.width).clamp(0., 1.);
+        let size = (TILE_MIN + fraction * (TILE_MAX - TILE_MIN)).round();
+        if size != self.tile_size {
+            self.tile_size = size;
+            cx.notify();
+        }
     }
 
     // ── Updates ─────────────────────────────────────────────────────────
@@ -691,7 +758,7 @@ impl AuroraApp {
                         div()
                             .text_color(rgb(color::ACCENT))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Aurora"),
+                            .child("Aurora NG"),
                     )
                     .child(muted(concat!("v", env!("CARGO_PKG_VERSION")))),
             )
@@ -701,6 +768,9 @@ impl AuroraApp {
                     .items_center()
                     .gap_4()
                     .child(div().text_sm().text_color(rgb(color::MUTED)).child(status))
+                    .when(self.cover_wall, |row| {
+                        row.child(self.render_size_slider(cx))
+                    })
                     .when(matches!(self.load_state, LoadState::Ready), |row| {
                         row.child(
                             text_button("cover-wall", "Cover wall", self.cover_wall).on_click(
@@ -837,20 +907,30 @@ impl AuroraApp {
     }
 
     fn render_wall(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tile = px(self.tile_size);
+        let gap = px((self.tile_size * 0.1).clamp(6., 18.));
+        let show_text = self.tile_size >= TILE_MIN_FOR_TEXT;
+        let row_height = gap + tile + if show_text { TILE_TEXT_HEIGHT } else { px(0.) };
+        self.thumbnail_size = covers::thumbnail_size(self.tile_size * window.scale_factor());
+
         let width = window.viewport_size().width;
-        let columns = (((width - TILE_GAP) / (TILE + TILE_GAP)).floor() as usize).max(1);
-        if columns != self.wall_columns {
-            // Keep the same albums in view when the window is resized.
-            let scrolled = -self.wall_scroll.0.borrow().base_handle.offset().y;
-            let top_row = (scrolled / TILE_ROW_HEIGHT).max(0.) as usize;
-            let first = top_row * self.wall_columns;
-            self.wall_scroll
-                .scroll_to_item(first / columns, ScrollStrategy::Top);
+        let columns = (((width - gap) / (tile + gap)).floor() as usize).max(1);
+        if columns != self.wall_columns || row_height != self.wall_row_height {
+            // Keep the album at the top left in view when the window or the
+            // cover size changes.
+            if self.wall_row_height > px(0.) {
+                let scrolled = -self.wall_scroll.0.borrow().base_handle.offset().y;
+                let top_row = (scrolled / self.wall_row_height).max(0.) as usize;
+                let first = top_row * self.wall_columns;
+                self.wall_scroll
+                    .scroll_to_item(first / columns, ScrollStrategy::Top);
+            }
             self.wall_columns = columns;
+            self.wall_row_height = row_height;
         }
         // Centre the grid; the last row stays left-aligned.
-        let used = TILE * columns as f32 + TILE_GAP * (columns as f32 - 1.);
-        let inset = ((width - used) / 2.).max(TILE_GAP / 2.);
+        let used = tile * columns as f32 + gap * (columns as f32 - 1.);
+        let inset = ((width - used) / 2.).max(gap / 2.);
         let rows = self.album_count.div_ceil(columns);
 
         let wall = uniform_list(
@@ -862,14 +942,15 @@ impl AuroraApp {
                     .map(|row| {
                         let start = row * columns;
                         let end = (start + columns).min(this.album_count);
-                        let tiles: Vec<_> =
-                            (start..end).map(|ix| this.render_tile(ix, cx)).collect();
+                        let tiles: Vec<_> = (start..end)
+                            .map(|ix| this.render_tile(ix, tile, show_text, cx))
+                            .collect();
                         div()
-                            .h(TILE_ROW_HEIGHT)
-                            .pt(TILE_GAP)
+                            .h(row_height)
+                            .pt(gap)
                             .pl(inset)
                             .flex()
-                            .gap(TILE_GAP)
+                            .gap(gap)
                             .children(tiles)
                     })
                     .collect()
@@ -899,7 +980,13 @@ impl AuroraApp {
             .child(div().flex_1().min_h_0().child(wall))
     }
 
-    fn render_tile(&mut self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_tile(
+        &mut self,
+        ix: usize,
+        tile: Pixels,
+        show_text: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let cover = self.cover(ix, cx);
         let (artist_ix, album_ix) = self.wall_album(ix);
         let selected =
@@ -912,7 +999,7 @@ impl AuroraApp {
         };
 
         let artwork = div()
-            .size(TILE)
+            .size(tile)
             .flex_none()
             .rounded_md()
             .overflow_hidden()
@@ -932,8 +1019,8 @@ impl AuroraApp {
                     .size_full()
                     .object_fit(ObjectFit::Cover),
             ),
-            // No cover: show the title instead.
-            Some(None) => artwork.child(
+            // No cover: show the title instead, when it fits.
+            Some(None) if show_text => artwork.child(
                 div()
                     .size_full()
                     .flex()
@@ -944,41 +1031,111 @@ impl AuroraApp {
                     .text_color(rgb(color::MUTED))
                     .child(album.title.clone()),
             ),
-            None => artwork,
+            Some(None) | None => artwork,
         };
 
         div()
             .id(("cover", ix))
             .group("tile")
-            .w(TILE)
+            .w(tile)
             .flex_none()
             .flex()
             .flex_col()
             .gap_1()
             .cursor_pointer()
             .child(artwork)
-            .child(
-                div()
-                    .flex_none()
-                    .mt_1()
-                    .truncate()
-                    .when(selected, |title| title.text_color(rgb(color::ACCENT)))
-                    .child(album.title.clone()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .truncate()
-                    .text_xs()
-                    .text_color(rgb(color::MUTED))
-                    .child(subtitle),
-            )
+            .when(show_text, |tile| {
+                tile.child(
+                    div()
+                        .flex_none()
+                        .mt_1()
+                        .truncate()
+                        .when(selected, |title| title.text_color(rgb(color::ACCENT)))
+                        .child(album.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(color::MUTED))
+                        .child(subtitle),
+                )
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.select_wall_album(ix, cx);
                 if event.click_count() >= 2 {
                     this.play_from(0, cx);
                 }
             }))
+    }
+
+    fn render_size_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fraction = (self.tile_size - TILE_MIN) / (TILE_MAX - TILE_MIN);
+        let bounds_cell = self.size_slider_bounds.clone();
+        let knob = px(12.);
+        let slider = div()
+            .id("cover-size")
+            .w(px(140.))
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.dragging_size = true;
+                    this.drag_size_to(event.position.x, cx);
+                }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(rgb(color::BAR))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(relative(fraction))
+                            .rounded_full()
+                            .bg(rgb(color::ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-4.))
+                            .left(relative(fraction))
+                            .ml(-knob / 2.)
+                            .size(knob)
+                            .rounded_full()
+                            .bg(rgb(if self.dragging_size {
+                                color::ACCENT_HOVER
+                            } else {
+                                color::ACCENT
+                            })),
+                    )
+                    // Remembers where the slider is on screen, to turn a mouse
+                    // position into a size.
+                    .child(
+                        canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {})
+                            .absolute()
+                            .size_full(),
+                    ),
+            );
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .text_xs()
+            .text_color(rgb(color::MUTED))
+            .child("Size")
+            .child(slider)
+            .child(div().w(px(32.)).child(format!("{}", self.tile_size as u32)))
     }
 
     fn render_now_playing(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1140,6 +1297,26 @@ impl Render for AuroraApp {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            // The size slider keeps following the mouse while the button is held.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.dragging_size {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_size_to(event.position.x, cx);
+                    } else {
+                        this.dragging_size = false;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.dragging_size {
+                        this.dragging_size = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()

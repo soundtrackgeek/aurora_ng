@@ -2,6 +2,18 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - 2026-11-11
+
+### Added
+
+- A **Size** slider in the header while the cover wall is shown sets the cover size from 50 to 500 pixels, updating the wall as you drag. The album at the top left stays in view. Below 100 pixels, titles are hidden so more covers fit.
+
+### Changed
+
+- The header says **Aurora NG** (Next Generation) instead of Aurora.
+- Cover thumbnails come in four sizes (128, 256, 512 and 1024 pixels). The wall uses the smallest one that is sharp at the current cover size and screen scaling, and keeps showing the smaller one until a bigger one is ready.
+- Thumbnail memory is limited to 192 MB instead of 300 thumbnails, since sizes now vary. Covers on screen are never dropped.
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
