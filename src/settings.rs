@@ -1,5 +1,5 @@
 //! What the app looks like when it closes, so it opens the same way next time:
-//! the view, the cover size, the selected album and the window.
+//! the view, the cover size, the selected album, the search and the window.
 //!
 //! Saved as JSON in `%LOCALAPPDATA%\aurora_ng\settings.json`. A missing or
 //! unreadable file gives the defaults.
@@ -22,6 +22,8 @@ pub struct Settings {
     pub details_open: bool,
     /// The selected track, by its catalog id.
     pub track_id: Option<i64>,
+    /// The search the albums were filtered by; empty for none.
+    pub search: String,
     pub window: Option<SavedWindow>,
 }
 
@@ -33,6 +35,7 @@ impl Default for Settings {
             album_id: None,
             details_open: false,
             track_id: None,
+            search: String::new(),
             window: None,
         }
     }
@@ -95,6 +98,7 @@ mod tests {
             album_id: Some("abc".to_owned()),
             details_open: true,
             track_id: Some(7),
+            search: "aartist:\"bon jovi\"".to_owned(),
             window: Some(SavedWindow {
                 x: 10.,
                 y: 20.,

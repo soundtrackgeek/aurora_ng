@@ -5,18 +5,22 @@ use crate::{
     audio::Audio,
     covers::{self, CoverIndex},
     library::{Album, Artist, Catalog, Track, catalog_path},
+    search,
     settings::{self, SavedWindow, Settings},
+    text_input::{InputEvent, TextInput},
     update::{self, Release},
 };
 use gpui::{
-    Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, ListAlignment,
-    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    Pixels, RenderImage, ScrollStrategy, SharedString, Stateful, Task, UniformListScrollHandle,
-    Window, WindowBounds, canvas, div, img, list, prelude::*, px, relative, rgb, svg, uniform_list,
+    Bounds, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, ImageSource, KeyDownEvent,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy, SharedString, Stateful,
+    Subscription, Task, UniformListScrollHandle, Window, WindowBounds, actions, canvas, div, img,
+    list, prelude::*, px, relative, rgb, svg, uniform_list,
 };
+use rusqlite::InterruptHandle;
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -28,6 +32,9 @@ const ROW_HEIGHT: Pixels = px(30.);
 const TICK: Duration = Duration::from_millis(250);
 /// Keystrokes this close together build one search, like "pink f".
 const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(1000);
+/// A search starts once typing has paused this long, so it does not run for
+/// every letter of a query. Enter searches right away.
+const SEARCH_DELAY: Duration = Duration::from_secs(2);
 
 /// Cover wall tiles: the square cover, then two lines of text when there is room.
 const TILE_MIN: f32 = 50.;
@@ -44,7 +51,9 @@ const TILE_INFO_HEIGHT: Pixels = px(44.);
 /// Memory for thumbnails; the ones off screen longest are dropped past this.
 const COVER_MEMORY_BYTES: usize = 192 * 1024 * 1024;
 
-mod color {
+actions!(aurora, [FocusSearch]);
+
+pub(crate) mod color {
     pub const BACKGROUND: u32 = 0x0e1016;
     pub const PANEL: u32 = 0x141720;
     pub const BORDER: u32 = 0x222634;
@@ -76,6 +85,13 @@ enum UpdateState {
     UpToDate,
     Available(Release),
     Installing(Release),
+    Failed(String),
+}
+
+enum SearchState {
+    Idle,
+    /// The query being run.
+    Searching(String),
     Failed(String),
 }
 
@@ -113,8 +129,23 @@ pub struct AuroraApp {
     focus_handle: FocusHandle,
     load_state: LoadState,
     catalog: Option<Catalog>,
+    /// Every album artist in the catalog.
+    library: Vec<Artist>,
+    library_album_count: usize,
+    /// The artists and albums shown: the library, or what the search found.
     artists: Vec<Artist>,
     album_count: usize,
+
+    search_input: Entity<TextInput>,
+    /// The query the shown albums match; `None` shows the whole library.
+    search: Option<String>,
+    search_state: SearchState,
+    /// The delay before searching, then the search itself. Replacing it
+    /// cancels both.
+    search_task: Option<Task<()>>,
+    /// Stops a search the catalog is still running when a newer one starts.
+    search_interrupt: Option<InterruptHandle>,
+    _search_events: Subscription,
 
     /// Where each artist's albums start in the cover wall, which lists every
     /// album in artist order.
@@ -182,6 +213,14 @@ impl AuroraApp {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
 
+        let search_input = cx.new(|cx| {
+            TextInput::new(
+                "Search albums — aartist:\"bon jovi\", year:1980..1989 AND cr:..99   (Ctrl+K)",
+                cx,
+            )
+        });
+        let search_events = cx.subscribe_in(&search_input, window, Self::on_search_event);
+
         // Remember how everything looks for next time.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -246,8 +285,16 @@ impl AuroraApp {
             focus_handle,
             load_state: LoadState::Loading,
             catalog: None,
+            library: Vec::new(),
+            library_album_count: 0,
             artists: Vec::new(),
             album_count: 0,
+            search_input,
+            search: None,
+            search_state: SearchState::Idle,
+            search_task: None,
+            search_interrupt: None,
+            _search_events: search_events,
             album_offsets: Vec::new(),
             covers_found: Ok(0),
             cover_wall: settings.cover_wall,
@@ -299,22 +346,23 @@ impl AuroraApp {
                 artists,
                 covers,
             }) => {
-                self.album_offsets = artists
-                    .iter()
-                    .scan(0, |offset, artist| {
-                        let start = *offset;
-                        *offset += artist.albums.len();
-                        Some(start)
-                    })
-                    .collect();
-                self.album_count = artists.iter().map(|artist| artist.albums.len()).sum();
                 self.covers_found = covers;
                 self.catalog = Some(catalog);
-                self.artists = artists;
+                self.library_album_count = artists.iter().map(|artist| artist.albums.len()).sum();
+                self.library = artists;
+                self.set_artists(self.library.clone());
                 self.load_state = LoadState::Ready;
                 self.reset_wall_items();
                 if !self.restore_album(cx) && !self.artists.is_empty() {
                     self.select_artist(0, cx);
+                }
+                // Search again for what was shown last time; the album
+                // stays selected if it is among the results.
+                if !self.restore.search.is_empty() {
+                    let query = self.restore.search.clone();
+                    self.search_input
+                        .update(cx, |input, cx| input.set_text(query, cx));
+                    self.run_search(cx);
                 }
             }
             Err(error) => self.load_state = LoadState::Failed(error),
@@ -330,10 +378,7 @@ impl AuroraApp {
         let Some(id) = self.restore.album_id.as_deref() else {
             return false;
         };
-        let Some((artist, album)) = self.artists.iter().enumerate().find_map(|(ix, artist)| {
-            let album = artist.albums.iter().position(|album| album.id == id)?;
-            Some((ix, album))
-        }) else {
+        let Some((artist, album)) = self.find_album(id) else {
             return false;
         };
         self.selected_artist = Some(artist);
@@ -399,8 +444,244 @@ impl AuroraApp {
             album_id,
             details_open,
             track_id,
+            search: match self.load_state {
+                LoadState::Ready => self.search.clone().unwrap_or_default(),
+                _ => self.restore.search.clone(),
+            },
             window,
         }
+    }
+
+    // ── Search ──────────────────────────────────────────────────────────
+
+    fn on_search_event(
+        &mut self,
+        _: &Entity<TextInput>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Changed => {
+                // A query still running is for text that is gone now.
+                if let Some(interrupt) = self.search_interrupt.take() {
+                    interrupt.interrupt();
+                }
+                self.search_state = SearchState::Idle;
+                if self.search_text(cx).trim().is_empty() {
+                    // Clearing the box shows everything at once.
+                    self.run_search(cx);
+                } else {
+                    self.search_task = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(SEARCH_DELAY).await;
+                        this.update(cx, |this, cx| this.run_search(cx)).ok();
+                    }));
+                }
+            }
+            InputEvent::Submit => self.run_search(cx),
+            // Esc clears the search; a second Esc leaves the box.
+            InputEvent::Cancel => {
+                if self.search_text(cx).is_empty() {
+                    window.focus(&self.focus_handle);
+                } else {
+                    self.search_input
+                        .update(cx, |input, cx| input.set_text("", cx));
+                    self.run_search(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn search_text(&self, cx: &Context<Self>) -> String {
+        self.search_input.read(cx).text().to_owned()
+    }
+
+    /// Searches for what is in the box now, unless those albums are already shown.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.load_state, LoadState::Ready) {
+            return;
+        }
+        let query = self.search_text(cx).trim().to_owned();
+        match &self.search_state {
+            SearchState::Searching(running) if *running == query => return,
+            SearchState::Idle if self.search.as_deref().unwrap_or("") == query => {
+                self.search_task = None;
+                return;
+            }
+            _ => {}
+        }
+        self.search_task = None;
+        if let Some(interrupt) = self.search_interrupt.take() {
+            interrupt.interrupt();
+        }
+        cx.notify();
+
+        let parsed = match search::parse(&query) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.search_state = SearchState::Failed(error);
+                return;
+            }
+        };
+        if parsed.is_empty() {
+            self.search_state = SearchState::Idle;
+            if self.search.take().is_some() {
+                self.show_matches(None, cx);
+            }
+            return;
+        }
+        // A connection of its own, so the search runs off the UI thread.
+        let catalog = match catalog_path().and_then(|path| Catalog::open(&path)) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.search_state = SearchState::Failed(error);
+                return;
+            }
+        };
+        self.search_interrupt = Some(catalog.interrupt_handle());
+        self.search_state = SearchState::Searching(query.clone());
+        let job = cx
+            .background_executor()
+            .spawn(async move { catalog.search_album_ids(&parsed) });
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| this.finish_search(query, result, cx))
+                .ok();
+        }));
+    }
+
+    fn finish_search(
+        &mut self,
+        query: String,
+        result: Result<HashSet<String>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Ignore a search that was replaced while it ran.
+        if !matches!(&self.search_state, SearchState::Searching(running) if *running == query) {
+            return;
+        }
+        self.search_interrupt = None;
+        self.search_task = None;
+        match result {
+            Ok(ids) => {
+                self.search_state = SearchState::Idle;
+                self.search = Some(query);
+                self.show_matches(Some(&ids), cx);
+            }
+            Err(error) => self.search_state = SearchState::Failed(error),
+        }
+        cx.notify();
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.run_search(cx);
+        window.focus(&self.focus_handle);
+    }
+
+    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.search_input.focus_handle(cx));
+        self.search_input
+            .update(cx, |input, cx| input.select_all_text(cx));
+    }
+
+    /// Shows the albums with these ids, or every album. The selected album
+    /// stays selected, with its details open, when it is still shown.
+    fn show_matches(&mut self, ids: Option<&HashSet<String>>, cx: &mut Context<Self>) {
+        let selected_id = self.selected_album_id();
+        let details_were_open = self.open_album.is_some();
+        let artists = match ids {
+            None => self.library.clone(),
+            Some(ids) => self
+                .library
+                .iter()
+                .filter_map(|artist| {
+                    let albums: Vec<Album> = artist
+                        .albums
+                        .iter()
+                        .filter(|album| ids.contains(&album.id))
+                        .cloned()
+                        .collect();
+                    (!albums.is_empty()).then(|| Artist {
+                        name: artist.name.clone(),
+                        sort_key: artist.sort_key.clone(),
+                        albums,
+                    })
+                })
+                .collect(),
+        };
+        self.set_artists(artists);
+
+        // Covers are kept by wall position, and every position changed.
+        for (_, cover) in self.covers.drain() {
+            match cover {
+                Cover::Ready { image, .. }
+                | Cover::Loading {
+                    previous: Some(image),
+                    ..
+                } => self.stale_images.push(image),
+                _ => {}
+            }
+        }
+        self.open_album = None;
+        self.reveal_details = 0;
+        self.reset_wall_items();
+
+        match selected_id.and_then(|id| self.find_album(&id)) {
+            Some((artist, album)) => {
+                // Its tracks are already loaded.
+                self.selected_artist = Some(artist);
+                self.selected_album = Some(album);
+                let ix = self.album_offsets[artist] + album;
+                if details_were_open && self.cover_wall {
+                    self.open_details(ix);
+                }
+                self.scroll_wall_to_album(ix);
+                self.artist_scroll
+                    .scroll_to_item(artist, ScrollStrategy::Center);
+                self.album_scroll
+                    .scroll_to_item(album, ScrollStrategy::Center);
+            }
+            None if !self.artists.is_empty() => {
+                self.select_artist(0, cx);
+                self.scroll_wall_to_album(0);
+                self.artist_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            None => {
+                self.selected_artist = None;
+                self.select_album(0, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Shows these artists, and works out where their albums are on the wall.
+    fn set_artists(&mut self, artists: Vec<Artist>) {
+        self.album_offsets = artists
+            .iter()
+            .scan(0, |offset, artist| {
+                let start = *offset;
+                *offset += artist.albums.len();
+                Some(start)
+            })
+            .collect();
+        self.album_count = artists.iter().map(|artist| artist.albums.len()).sum();
+        self.artists = artists;
+    }
+
+    /// The shown artist and album with this catalog id.
+    fn find_album(&self, id: &str) -> Option<(usize, usize)> {
+        self.artists.iter().enumerate().find_map(|(ix, artist)| {
+            let album = artist.albums.iter().position(|album| album.id == id)?;
+            Some((ix, album))
+        })
+    }
+
+    fn selected_album_id(&self) -> Option<String> {
+        let (artist, album) = self.selected_artist.zip(self.selected_album)?;
+        Some(self.artists.get(artist)?.albums.get(album)?.id.clone())
     }
 
     // ── Browsing ────────────────────────────────────────────────────────
@@ -534,6 +815,7 @@ impl AuroraApp {
 
     /// Scrolls so the row with wall position `ix` is at the top.
     fn scroll_wall_to_album(&mut self, ix: usize) {
+        let ix = ix.min(self.album_count.saturating_sub(1));
         let item = self.row_item(ix / self.wall_columns);
         self.wall_list.scroll_to(ListOffset {
             item_ix: item,
@@ -895,7 +1177,11 @@ impl AuroraApp {
         cx.notify();
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed in the search box are for the search.
+        if self.search_input.focus_handle(cx).is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
@@ -971,6 +1257,13 @@ impl AuroraApp {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = match &self.load_state {
             LoadState::Loading => "Loading library…".into(),
+            LoadState::Ready if self.search.is_some() => format!(
+                "{} of {} albums · {} artists",
+                thousands(self.album_count),
+                thousands(self.library_album_count),
+                thousands(self.artists.len())
+            )
+            .into(),
             LoadState::Ready => match &self.covers_found {
                 Ok(covers) => format!(
                     "{} artists · {} albums · {} covers",
@@ -1008,6 +1301,7 @@ impl AuroraApp {
                     )
                     .child(muted(concat!("v", env!("CARGO_PKG_VERSION")))),
             )
+            .child(self.render_search(cx))
             .child(
                 div()
                     .flex()
@@ -1028,6 +1322,49 @@ impl AuroraApp {
                     })
                     .child(self.render_update(cx)),
             )
+    }
+
+    /// The search box, a button to clear it, and what the search is doing.
+    fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_text = !self.search_input.read(cx).text().is_empty();
+        let state = match &self.search_state {
+            SearchState::Idle if self.search.is_some() && self.album_count == 0 => {
+                Some(("No albums match".to_owned(), color::MUTED))
+            }
+            SearchState::Idle => None,
+            SearchState::Searching(_) => Some(("Searching…".to_owned(), color::MUTED)),
+            SearchState::Failed(error) => Some((error.clone(), color::ERROR)),
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .mx_6()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.))
+                    .max_w(px(560.))
+                    .child(self.search_input.clone()),
+            )
+            .when(has_text, |row| {
+                row.child(text_button("clear-search", "Clear", false).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.clear_search(window, cx)),
+                ))
+            })
+            .when_some(state, |row, (text, text_color)| {
+                row.child(
+                    div()
+                        .flex_shrink()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(text_color))
+                        .child(text),
+                )
+            })
     }
 
     fn render_artists(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1766,6 +2103,11 @@ impl Render for AuroraApp {
         let body = match &self.load_state {
             LoadState::Loading => message("Loading your library…".to_owned(), color::MUTED),
             LoadState::Failed(error) => message(error.clone(), color::ERROR),
+            LoadState::Ready if self.artists.is_empty() && self.search.is_some() => message(
+                "No albums match this search. Press Esc in the search box to show everything."
+                    .to_owned(),
+                color::MUTED,
+            ),
             LoadState::Ready if self.cover_wall => {
                 div().size_full().child(self.render_wall(window, cx))
             }
@@ -1780,6 +2122,7 @@ impl Render for AuroraApp {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(Self::focus_search))
             // The size slider keeps following the mouse while the button is held.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.dragging_size {

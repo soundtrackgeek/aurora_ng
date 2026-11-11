@@ -1,12 +1,13 @@
 //! Read-only access to Music Library's catalog, the same SQLite database Aurora reads.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, InterruptHandle, OpenFlags, functions::FunctionFlags};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+#[derive(Clone)]
 pub struct Album {
     pub id: String,
     pub title: String,
@@ -27,6 +28,7 @@ pub struct Album {
     pub cover: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 pub struct Artist {
     pub name: String,
     /// Lowercase name, used for sorting and type-to-find.
@@ -91,7 +93,21 @@ impl Catalog {
         connection
             .pragma_update(None, "query_only", true)
             .map_err(|error| format!("Could not make the catalog read-only: {error}"))?;
+        register_functions(&connection)?;
         Ok(Self { connection })
+    }
+
+    /// Stops a query running on this connection from another thread.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.connection.get_interrupt_handle()
+    }
+
+    /// The ids of the albums a search finds.
+    pub fn search_album_ids(
+        &self,
+        search: &crate::search::Search,
+    ) -> Result<HashSet<String>, String> {
+        crate::search::album_ids(&self.connection, search)
     }
 
     /// Every album artist with their albums, sorted by name, then by year.
@@ -211,6 +227,23 @@ impl Catalog {
             .collect::<Result<_, _>>()
             .map_err(|error| format!("Could not read a track: {error}"))
     }
+}
+
+/// `unicode_lower`, which Music Library defines in its catalog and uses in
+/// artist keys; SQLite's own `lower` only knows ASCII.
+pub fn register_functions(connection: &Connection) -> Result<(), String> {
+    connection
+        .create_scalar_function(
+            "unicode_lower",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                Ok(context
+                    .get::<Option<String>>(0)?
+                    .map(|text| text.to_lowercase()))
+            },
+        )
+        .map_err(|error| format!("Could not prepare the catalog: {error}"))
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {

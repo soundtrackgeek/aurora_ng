@@ -4,14 +4,24 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.9.0** browses your library, shows a wall of album covers, plays music, and keeps itself up to date.
+Version **0.10.0** browses and searches your library, shows a wall of album covers, plays music, and keeps itself up to date.
 
 ## What it does
 
 - **Browse**: three columns, **Artists → Albums → Tracks**. Click an artist to see their albums (oldest first), and click an album to see its tracks. Long lists scroll smoothly, even with tens of thousands of artists.
 - **Cover wall**: click **Cover wall** in the header to swap the columns for a grid of every album's cover, in artist order. From 300 pixels up, every cover also shows two more lines under its title: genre · label · track count · length, then the average rating in stars and the Album Score. Click a cover to open the album's details right below its row, pushing the covers underneath down: a header with the same info (only on smaller covers, where it isn't already under the cover), then every track with its number, title, artist (when it differs from the album artist), time, star rating and a heart for loved tracks. Click the cover again or press Esc to close the details. Double-click a cover to play the album, or double-click a track in the details to play from there. Typing an artist's name jumps to their albums. Drag the **Size** slider in the header to make the covers anywhere from 50 to 500 pixels wide; the wall updates as you drag. Below 100 pixels, the titles are hidden so more covers fit. Click **Cover wall** again to go back to the columns, with the same album selected.
-- **Picks up where you left off**: closing the app remembers the view (cover wall or columns), the cover size, the selected album and track, whether its details were open, and the window's position and size. The next start opens the same way, with that album in view. The first start opens on the cover wall with 500-pixel covers. The settings are kept in `%LOCALAPPDATA%\aurora_ng\settings.json`; delete it to start fresh.
-- **Find an artist**: start typing a name anywhere in the window ("pink f") to jump to the first matching artist.
+- **Picks up where you left off**: closing the app remembers the view (cover wall or columns), the cover size, the search, the selected album and track, whether its details were open, and the window's position and size. The next start opens the same way, with that album in view. The first start opens on the cover wall with 500-pixel covers. The settings are kept in `%LOCALAPPDATA%\aurora_ng\settings.json`; delete it to start fresh.
+- **Search**: the box in the header filters the albums, on the cover wall and in the columns, with the same search language as Aurora ([Aurora's search guide](https://github.com/soundtrackgeek/aurora/blob/master/docs/search.md)). Click it or press **Ctrl+K** (or **Ctrl+F**) and type; the search starts once you stop typing for 2 seconds, or right away with **Enter**. **Esc** or **Clear** empties the box and shows everything again; a second **Esc** leaves the box. The header then shows how many albums matched, like "1,756 of 73,931 albums · 412 artists". The selected album stays selected (with its details open) when it is among the results, and the search is remembered for the next start. Some examples:
+
+  | Query | Finds |
+  | --- | --- |
+  | `aartist:"bon jovi"` | Albums whose album artist is exactly Bon Jovi |
+  | `aartist:bon jovi` | Album artists with words starting with "bon" and "jovi": Bon Jovi and Jon Bon Jovi |
+  | `year:2000..2009 AND genre:scores AND cr:..99` | Score albums from 2000 through 2009 that are 0–99% rated |
+  | `year:1980..1985 AND cr:..99 AND love:1.. NOT genre:scores OR soundtrack` | 1980–1985 albums, not fully rated, with at least one loved track, that are neither scores nor soundtracks |
+
+  Fields: `artist:` (track artist), `aartist:` (album artist), `album:`, `title:`, `genre:`, `publisher:`, `country:`, `year:` (original year), `ryear:` (release year), `cr:` (rating completeness %), `love:` (loved tracks), `single:` (official singles), `minutes:`, `ar:` (album rating, 0–5), `bb:`, `uk:`, `vg:` (chart ranks), `born:`, `dead:`, `founded:`, `dissolved:`. Unquoted words match word beginnings; quotes match the whole value exactly. Combine with `AND` or a comma, `OR` (the value after it keeps the field: `year:1985 OR 1987`) and `NOT` or a leading `-`; operators must be uppercase. Ranges use `..` and include both ends: `year:1985..`, `cr:50..80`, `love:..3`. `genre:scores` stands for the film, TV and game score genres (Action, Animation, Comedy, Documentary, Drama, Fantasy, Horror, Sci-Fi, Thriller, TV, Video Game, Western, Anime). `sonic:` is not available, since it needs Aurora's audio analysis. A query that is not valid shows what is wrong next to the box.
+- **Find an artist**: start typing a name anywhere in the window ("pink f") to jump to the first matching artist (not while typing in the search box).
 - **Play**: double-click an album to play it from the start, or double-click a track to play the album from that track. The album plays through to the end.
 - **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds.
 - **Space** plays or pauses.

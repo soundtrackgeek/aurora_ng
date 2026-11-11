@@ -2,6 +2,15 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.10.0] - 2026-11-11
+
+### Added
+
+- A search box in the header that filters the albums on the cover wall and in the columns, using Aurora's search language: fields such as `aartist:`, `genre:`, `year:`, `cr:` and `love:`, exact values in quotes, ranges with `..`, and `AND`, `OR`, `NOT`. `genre:scores` covers every film, TV and game score genre. For example, `year:2000..2009 AND genre:scores AND cr:..99` finds score albums from the 2000s that are not fully rated, and `aartist:"bon jovi"` finds Bon Jovi but not Jon Bon Jovi.
+- The search starts 2 seconds after you stop typing, so it does not run for every letter; Enter searches right away. Esc or **Clear** shows everything again. Ctrl+K or Ctrl+F jumps to the box.
+- The header shows how many albums and artists matched, and explains a query it cannot read. The selected album stays selected when it is among the results.
+- The search is remembered and runs again at the next start.
+
 ## [0.9.0] - 2026-11-11
 
 ### Added

@@ -6,11 +6,13 @@ mod audio;
 mod covers;
 mod install;
 mod library;
+mod search;
 mod settings;
+mod text_input;
 mod update;
 
 use gpui::{
-    App, Application, AssetSource, Bounds, SharedString, TitlebarOptions, WindowBounds,
+    App, Application, AssetSource, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions, point, prelude::*, px, size,
 };
 use settings::{SavedWindow, Settings};
@@ -47,6 +49,12 @@ fn main() {
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
+            text_input::bind_keys(cx);
+            // Ctrl+K as in Aurora; Ctrl+F because it is what most apps use.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-k", app::FocusSearch, None),
+                KeyBinding::new("ctrl-f", app::FocusSearch, None),
+            ]);
             let window_bounds = settings
                 .window
                 .and_then(|saved| saved_window_bounds(saved, cx))
