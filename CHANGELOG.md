@@ -2,6 +2,17 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.5.0] - 2026-11-11
+
+### Added
+
+- Album details on the cover wall: clicking a cover opens a panel right below its row, pushing the covers underneath down. It shows the album's title, artist and year, its track count, total length, label, average rating in stars and Album Score, and a table of tracks with number, title, artist (only when it differs from the album artist), time, star rating and Love. Click the cover again or press Esc to close it; double-click a track to play the album from there.
+- When the details open near the bottom of the window, the wall scrolls just enough to show them, keeping the album's row in view.
+
+### Changed
+
+- The year under a cover is always the album's original year. It no longer falls back to the release year when the year is missing.
+
 ## [0.4.0] - 2026-11-11
 
 ### Added

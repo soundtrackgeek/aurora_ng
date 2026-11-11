@@ -8,10 +8,10 @@ use crate::{
     update::{self, Release},
 };
 use gpui::{
-    Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy,
-    SharedString, Stateful, Task, UniformListScrollHandle, Window, canvas, div, img, prelude::*,
-    px, relative, rgb, svg, uniform_list,
+    Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Pixels, RenderImage, ScrollStrategy, SharedString, Stateful, Task, UniformListScrollHandle,
+    Window, canvas, div, img, list, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use std::{
     cell::Cell,
@@ -51,6 +51,18 @@ mod color {
     pub const ACCENT_HOVER: u32 = 0x99f6e4;
     pub const BAR: u32 = 0x2a2f3f;
     pub const ERROR: u32 = 0xf87171;
+    pub const STAR: u32 = 0xfbbf24;
+    pub const LOVE: u32 = 0xf472b6;
+    /// Empty stars and hearts.
+    pub const UNSET: u32 = 0x3a4052;
+}
+
+/// An item in the cover wall's list: a row of covers, or the details of the
+/// open album, which sits right under its row.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum WallItem {
+    Row(usize),
+    Details,
 }
 
 enum UpdateState {
@@ -106,7 +118,13 @@ pub struct AuroraApp {
     covers_found: Result<usize, String>,
 
     cover_wall: bool,
-    wall_scroll: UniformListScrollHandle,
+    /// Rows of covers, plus the open album's details when there is one.
+    wall_list: ListState,
+    /// The wall position of the album whose details are open.
+    open_album: Option<usize>,
+    /// Frames left to scroll newly opened details into view; their height is
+    /// only known once they have been drawn.
+    reveal_details: u8,
     wall_columns: usize,
     wall_row_height: Pixels,
     /// Cover width in pixels, set with the slider.
@@ -211,7 +229,9 @@ impl AuroraApp {
             album_offsets: Vec::new(),
             covers_found: Ok(0),
             cover_wall: false,
-            wall_scroll: UniformListScrollHandle::new(),
+            wall_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            open_album: None,
+            reveal_details: 0,
             wall_columns: 1,
             wall_row_height: px(0.),
             tile_size: TILE_DEFAULT,
@@ -264,6 +284,7 @@ impl AuroraApp {
                 self.catalog = Some(catalog);
                 self.artists = artists;
                 self.load_state = LoadState::Ready;
+                self.reset_wall_items();
                 if !self.artists.is_empty() {
                     self.select_artist(0, cx);
                 }
@@ -282,6 +303,8 @@ impl AuroraApp {
     }
 
     fn select_album(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // The details always belong to the selected album.
+        self.close_details();
         self.selected_album = None;
         self.selected_track = None;
         self.tracks.clear();
@@ -323,8 +346,7 @@ impl AuroraApp {
             self.select_artist(ix, cx);
             self.artist_scroll.scroll_to_item(ix, ScrollStrategy::Top);
             if self.cover_wall {
-                let row = self.album_offsets[ix] / self.wall_columns;
-                self.wall_scroll.scroll_to_item(row, ScrollStrategy::Top);
+                self.scroll_wall_to_album(self.album_offsets[ix]);
             }
         }
     }
@@ -336,8 +358,7 @@ impl AuroraApp {
         // Keep the selected album in view when switching.
         if let (Some(artist), Some(album)) = (self.selected_artist, self.selected_album) {
             if self.cover_wall {
-                let row = (self.album_offsets[artist] + album) / self.wall_columns;
-                self.wall_scroll.scroll_to_item(row, ScrollStrategy::Center);
+                self.scroll_wall_to_album(self.album_offsets[artist] + album);
             } else {
                 self.artist_scroll
                     .scroll_to_item(artist, ScrollStrategy::Center);
@@ -352,6 +373,114 @@ impl AuroraApp {
     fn wall_album(&self, ix: usize) -> (usize, usize) {
         let artist = self.album_offsets.partition_point(|&start| start <= ix) - 1;
         (artist, ix - self.album_offsets[artist])
+    }
+
+    /// The number of rows of covers.
+    fn wall_rows(&self) -> usize {
+        self.album_count.div_ceil(self.wall_columns)
+    }
+
+    /// The row the open album's details follow.
+    fn details_row(&self) -> Option<usize> {
+        self.open_album.map(|ix| ix / self.wall_columns)
+    }
+
+    fn wall_item_count(&self) -> usize {
+        self.wall_rows() + usize::from(self.open_album.is_some())
+    }
+
+    fn wall_item(&self, item: usize) -> WallItem {
+        match self.details_row() {
+            Some(row) if item == row + 1 => WallItem::Details,
+            Some(row) if item > row + 1 => WallItem::Row(item - 1),
+            _ => WallItem::Row(item),
+        }
+    }
+
+    /// The list item that shows row `row`.
+    fn row_item(&self, row: usize) -> usize {
+        match self.details_row() {
+            Some(details) if row > details => row + 1,
+            _ => row,
+        }
+    }
+
+    /// The first album at the top of the wall's view.
+    fn top_wall_album(&self) -> usize {
+        let top = self.wall_list.logical_scroll_top();
+        if top.item_ix >= self.wall_list.item_count() {
+            return 0;
+        }
+        match self.wall_item(top.item_ix) {
+            WallItem::Row(row) => row * self.wall_columns,
+            WallItem::Details => self.open_album.unwrap_or(0),
+        }
+    }
+
+    /// Makes the list match the rows, forgetting every measured height.
+    fn reset_wall_items(&mut self) {
+        let old = self.wall_list.item_count();
+        self.wall_list.splice(0..old, self.wall_item_count());
+    }
+
+    /// Scrolls so the row with wall position `ix` is at the top.
+    fn scroll_wall_to_album(&mut self, ix: usize) {
+        let item = self.row_item(ix / self.wall_columns);
+        self.wall_list.scroll_to(ListOffset {
+            item_ix: item,
+            offset_in_item: px(0.),
+        });
+    }
+
+    /// Opens the details for wall position `ix` under its row, pushing the
+    /// rows below down.
+    fn open_details(&mut self, ix: usize) {
+        self.close_details();
+        self.open_album = Some(ix);
+        let item = ix / self.wall_columns + 1;
+        self.wall_list.splice(item..item, 1);
+        self.reveal_details = 4;
+    }
+
+    fn close_details(&mut self) {
+        if let Some(row) = self.details_row() {
+            self.wall_list.splice(row + 1..row + 2, 0);
+            self.open_album = None;
+            self.reveal_details = 0;
+        }
+    }
+
+    /// Once the new details have been measured, scrolls just enough to show
+    /// them, without pushing their row of covers off the top.
+    fn reveal_open_details(&mut self, window: &mut Window) {
+        if self.reveal_details == 0 {
+            return;
+        }
+        let Some(row) = self.details_row() else {
+            self.reveal_details = 0;
+            return;
+        };
+        let row_bounds = self.wall_list.bounds_for_item(row);
+        let details_bounds = self.wall_list.bounds_for_item(row + 1);
+        match (row_bounds, details_bounds) {
+            (Some(row_bounds), Some(details_bounds)) => {
+                let view = self.wall_list.viewport_bounds();
+                let hidden = details_bounds.bottom() - view.bottom();
+                let room = row_bounds.top() - view.top();
+                if hidden > px(0.) && room > px(0.) {
+                    self.wall_list.scroll_by(hidden.min(room));
+                }
+                self.reveal_details = 0;
+            }
+            // The row is above the view, so there is nothing to keep in sight.
+            (None, _) if self.wall_list.logical_scroll_top().item_ix > row => {
+                self.reveal_details = 0;
+            }
+            _ => {
+                self.reveal_details -= 1;
+                window.request_animation_frame();
+            }
+        }
     }
 
     fn select_wall_album(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -663,6 +792,12 @@ impl AuroraApp {
         }
         let typing =
             !self.type_ahead.is_empty() && self.type_ahead_at.elapsed() < TYPE_AHEAD_WINDOW;
+        if keystroke.key == "escape" && self.open_album.is_some() {
+            self.close_details();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let text = match (keystroke.key.as_str(), keystroke.key_char.as_deref()) {
             // Space plays or pauses, unless it is part of a name like "pink floyd".
             ("space", _) if !typing => {
@@ -915,48 +1050,46 @@ impl AuroraApp {
 
         let width = window.viewport_size().width;
         let columns = (((width - gap) / (tile + gap)).floor() as usize).max(1);
-        if columns != self.wall_columns || row_height != self.wall_row_height {
-            // Keep the album at the top left in view when the window or the
-            // cover size changes.
-            if self.wall_row_height > px(0.) {
-                let scrolled = -self.wall_scroll.0.borrow().base_handle.offset().y;
-                let top_row = (scrolled / self.wall_row_height).max(0.) as usize;
-                let first = top_row * self.wall_columns;
-                self.wall_scroll
-                    .scroll_to_item(first / columns, ScrollStrategy::Top);
-            }
+        let changed = columns != self.wall_columns || row_height != self.wall_row_height;
+        if changed || self.wall_list.item_count() != self.wall_item_count() {
+            // Rows change height or contents: keep the album at the top left
+            // in view.
+            let top = self.top_wall_album();
             self.wall_columns = columns;
             self.wall_row_height = row_height;
+            self.reset_wall_items();
+            self.scroll_wall_to_album(top);
         }
+        self.reveal_open_details(window);
         // Centre the grid; the last row stays left-aligned.
         let used = tile * columns as f32 + gap * (columns as f32 - 1.);
         let inset = ((width - used) / 2.).max(gap / 2.);
-        let rows = self.album_count.div_ceil(columns);
 
-        let wall = uniform_list(
-            "cover-wall",
-            rows,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
-                let columns = this.wall_columns;
-                range
-                    .map(|row| {
-                        let start = row * columns;
-                        let end = (start + columns).min(this.album_count);
-                        let tiles: Vec<_> = (start..end)
-                            .map(|ix| this.render_tile(ix, tile, show_text, cx))
-                            .collect();
-                        div()
-                            .h(row_height)
-                            .pt(gap)
-                            .pl(inset)
-                            .flex()
-                            .gap(gap)
-                            .children(tiles)
-                    })
-                    .collect()
+        let wall = list(
+            self.wall_list.clone(),
+            cx.processor(move |this, item: usize, _, cx| match this.wall_item(item) {
+                WallItem::Row(row) => {
+                    let start = row * this.wall_columns;
+                    let end = (start + this.wall_columns).min(this.album_count);
+                    let tiles: Vec<_> = (start..end)
+                        .map(|ix| this.render_tile(ix, tile, show_text, cx))
+                        .collect();
+                    div()
+                        .h(row_height)
+                        .pt(gap)
+                        .pl(inset)
+                        .flex()
+                        .gap(gap)
+                        .children(tiles)
+                        .into_any_element()
+                }
+                WallItem::Details => div()
+                    .pt(gap)
+                    .pl(inset)
+                    .child(this.render_details(used, cx))
+                    .into_any_element(),
             }),
         )
-        .track_scroll(self.wall_scroll.clone())
         .size_full();
 
         div()
@@ -1062,12 +1195,192 @@ impl AuroraApp {
                         .child(subtitle),
                 )
             })
+            // A click opens or closes the album's details; a double-click plays it.
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.select_wall_album(ix, cx);
-                if event.click_count() >= 2 {
-                    this.play_from(0, cx);
+                let double = event.click_count() >= 2;
+                if this.open_album == Some(ix) && !double {
+                    this.close_details();
+                } else {
+                    this.select_wall_album(ix, cx);
+                    if this.open_album != Some(ix) {
+                        this.open_details(ix);
+                    }
+                    if double {
+                        this.play_from(0, cx);
+                    }
                 }
+                cx.notify();
             }))
+    }
+
+    /// The open album's details: what it is, then its tracks.
+    fn render_details(&self, width: Pixels, cx: &mut Context<Self>) -> Div {
+        let panel = div()
+            .w(width)
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_5()
+            .rounded_md()
+            .bg(rgb(color::PANEL))
+            .border_1()
+            .border_color(rgb(color::BORDER));
+        let Some(ix) = self.open_album else {
+            return panel;
+        };
+        let (artist_ix, album_ix) = self.wall_album(ix);
+        let artist = &self.artists[artist_ix];
+        let album = &artist.albums[album_ix];
+
+        let subtitle = match album.year {
+            Some(year) => format!("{} · {year}", artist.name),
+            None => artist.name.clone(),
+        };
+        let seconds = album.total_seconds.or_else(|| {
+            let total: i64 = self
+                .tracks
+                .iter()
+                .filter_map(|track| track.duration_seconds)
+                .sum();
+            Some(total).filter(|&total| total > 0)
+        });
+        let track_count = album.total_tracks.unwrap_or(self.tracks.len() as i64);
+        let rating = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(stars(album.rating, px(14.)))
+            .child(match album.rating {
+                Some(rating) => format!("{:.1}", rating as f32 / 20.),
+                None => "Not rated".to_owned(),
+            });
+        let stats = div()
+            .flex()
+            .flex_wrap()
+            .gap_x_8()
+            .gap_y_3()
+            .child(stat("Tracks", track_count.to_string()))
+            .child(stat(
+                "Length",
+                seconds.map(clock).unwrap_or_else(|| "—".into()),
+            ))
+            .child(stat(
+                "Label",
+                album.publisher.clone().unwrap_or_else(|| "—".into()),
+            ))
+            .child(stat("Average rating", rating))
+            .child(stat(
+                "Album score",
+                album
+                    .score
+                    .map(|score| format!("{score:.1}"))
+                    .unwrap_or_else(|| "—".into()),
+            ));
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(album.title.clone()),
+            )
+            .child(div().text_color(rgb(color::MUTED)).child(subtitle));
+
+        let panel = panel.child(header).child(stats);
+        if let Some(error) = &self.tracks_error {
+            return panel.child(div().text_color(rgb(color::ERROR)).child(error.clone()));
+        }
+
+        // Show the artist column only when some track is by someone else.
+        let other_artists = self.tracks.iter().any(|track| track.artist != artist.name);
+        let multi_disc = self.tracks.iter().any(|track| track.disc.unwrap_or(1) > 1);
+        let playing_id = self.current_track().map(|track| track.id);
+        let columns = |row: Stateful<Div>, cells: [Div; 6]| {
+            let [number, title, track_artist, time, rating, love] = cells;
+            row.child(number.w(px(36.)).flex().justify_end().flex_none())
+                .child(title.flex_1().min_w_0().truncate())
+                .when(other_artists, |row| {
+                    row.child(track_artist.w(relative(0.25)).flex_none().truncate())
+                })
+                .child(time.w(px(52.)).flex().justify_end().flex_none())
+                .child(rating.w(px(96.)).flex().justify_center().flex_none())
+                .child(love.w(px(28.)).flex().justify_center().flex_none())
+        };
+        let heading = |text: &'static str| div().child(text);
+        let table_header = columns(
+            div()
+                .id("details-header")
+                .h(px(26.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_xs()
+                .text_color(rgb(color::MUTED))
+                .border_b_1()
+                .border_color(rgb(color::BORDER)),
+            [
+                heading("#"),
+                heading("TITLE"),
+                heading("ARTIST"),
+                heading("TIME"),
+                heading("RATING"),
+                heading(""),
+            ],
+        );
+        let rows: Vec<_> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(track_ix, track)| {
+                let playing = playing_id == Some(track.id);
+                let number = if playing {
+                    div().child(
+                        svg()
+                            .path("icons/play.svg")
+                            .size_3()
+                            .text_color(rgb(color::ACCENT)),
+                    )
+                } else {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(color::MUTED))
+                        .child(track.position_label(multi_disc))
+                };
+                let track_artist = div().text_xs().text_color(rgb(color::MUTED));
+                let track_artist = if track.artist != artist.name {
+                    track_artist.child(track.artist.clone())
+                } else {
+                    track_artist
+                };
+                columns(
+                    row(track_ix, self.selected_track == Some(track_ix))
+                        .rounded_sm()
+                        .when(playing, |row| row.text_color(rgb(color::ACCENT)))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            this.selected_track = Some(track_ix);
+                            if event.click_count() >= 2 {
+                                this.play_from(track_ix, cx);
+                            }
+                            cx.notify();
+                        })),
+                    [
+                        number,
+                        div().child(track.title.clone()),
+                        track_artist,
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color::MUTED))
+                            .child(track.duration_seconds.map(clock).unwrap_or_default()),
+                        div().child(stars(track.rating, px(13.))),
+                        div().child(heart(track.loved, px(14.))),
+                    ],
+                )
+            })
+            .collect();
+        panel.child(div().flex().flex_col().child(table_header).children(rows))
     }
 
     fn render_size_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1455,6 +1768,72 @@ fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) 
         .child(label.into())
 }
 
+/// A label over a value, for the album details.
+fn stat(label: &'static str, value: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(color::MUTED))
+                .child(label.to_uppercase()),
+        )
+        .child(div().min_h(px(20.)).flex().items_center().child(value))
+}
+
+/// Whole and half stars filled in for a 0–100 rating (20 per star); all
+/// five are empty when there is no rating.
+fn stars(rating: Option<i64>, size: Pixels) -> Div {
+    let halves = star_halves(rating);
+    let icon = move |color: u32| {
+        svg()
+            .path("icons/star.svg")
+            .size(size)
+            .text_color(rgb(color))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .children((0..5).map(|star| {
+            let filled = (halves - star * 2).clamp(0, 2);
+            div()
+                .relative()
+                .size(size)
+                .flex_none()
+                .child(icon(color::UNSET))
+                .when(filled > 0, |slot| {
+                    // A half star is a full one, clipped to its left half.
+                    slot.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h(size)
+                            .w(if filled == 2 { size } else { size / 2. })
+                            .overflow_hidden()
+                            .child(icon(color::STAR)),
+                    )
+                })
+        }))
+}
+
+/// 0–100 → half stars, 0 to 10.
+fn star_halves(rating: Option<i64>) -> i64 {
+    rating.map_or(0, |rating| (rating.clamp(0, 100) + 5) / 10)
+}
+
+fn heart(loved: bool, size: Pixels) -> impl IntoElement {
+    let (path, color) = if loved {
+        ("icons/heart.svg", color::LOVE)
+    } else {
+        ("icons/heart-outline.svg", color::UNSET)
+    };
+    svg().path(path).size(size).text_color(rgb(color))
+}
+
 /// 245 → "4:05", 3725 → "1:02:05".
 fn clock(seconds: i64) -> String {
     let seconds = seconds.max(0);
@@ -1488,6 +1867,15 @@ mod tests {
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(245), "4:05");
         assert_eq!(clock(3725), "1:02:05");
+    }
+
+    #[test]
+    fn rounds_ratings_to_half_stars() {
+        assert_eq!(star_halves(None), 0);
+        assert_eq!(star_halves(Some(20)), 2);
+        assert_eq!(star_halves(Some(70)), 7);
+        assert_eq!(star_halves(Some(86)), 9);
+        assert_eq!(star_halves(Some(100)), 10);
     }
 
     #[test]

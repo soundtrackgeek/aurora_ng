@@ -10,7 +10,16 @@ use std::{
 pub struct Album {
     pub id: String,
     pub title: String,
+    /// The original year, not the release year of a reissue.
     pub year: Option<i64>,
+    pub publisher: Option<String>,
+    pub total_tracks: Option<i64>,
+    pub total_seconds: Option<i64>,
+    /// 0–100, like track ratings: the explicit album rating, or the mean of
+    /// the tracks once every one is rated.
+    pub rating: Option<i64>,
+    /// Music Library's Album Score: an open-ended ranking number, not stars.
+    pub score: Option<f64>,
     /// The folder the album's files are in, like `D:\MUSIC\Kittie - Oracle (2001)`.
     pub folder: Option<String>,
     /// Filled in from the covers folder after loading.
@@ -32,6 +41,9 @@ pub struct Track {
     pub disc: Option<i64>,
     pub number: Option<i64>,
     pub duration_seconds: Option<i64>,
+    /// 0–100: 20 per star, so 70 is three and a half stars.
+    pub rating: Option<i64>,
+    pub loved: bool,
     pub path: PathBuf,
 }
 
@@ -86,8 +98,10 @@ impl Catalog {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT a.id, a.album, a.album_artist_display, COALESCE(a.year, a.release_year),
-                        (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1)
+                "SELECT a.id, a.album, a.album_artist_display, a.year,
+                        (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
+                        a.publisher, a.total_tracks, a.total_seconds,
+                        a.effective_album_rating, a.album_score
                  FROM albums a",
             )
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -99,14 +113,29 @@ impl Catalog {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
 
         let mut artists: BTreeMap<String, Artist> = BTreeMap::new();
         for row in rows {
-            let (id, title, artist, year, folder) =
-                row.map_err(|error| format!("Could not read an album: {error}"))?;
+            let (
+                id,
+                title,
+                artist,
+                year,
+                folder,
+                publisher,
+                total_tracks,
+                total_seconds,
+                rating,
+                score,
+            ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
             artists
@@ -121,6 +150,11 @@ impl Catalog {
                     id,
                     title: non_empty(title).unwrap_or_else(|| "Unknown Album".to_owned()),
                     year,
+                    publisher: non_empty(publisher),
+                    total_tracks,
+                    total_seconds,
+                    rating,
+                    score,
                     folder: non_empty(folder),
                     cover: None,
                 });
@@ -146,7 +180,8 @@ impl Catalog {
             .connection
             .prepare_cached(
                 "SELECT id, title, COALESCE(NULLIF(TRIM(display_artist), ''), album_artist_display),
-                        disc_number, track_number, time_seconds, file_path, filename
+                        disc_number, track_number, time_seconds, file_path, filename,
+                        normalized_rating, love
                  FROM tracks
                  WHERE album_id = ?1
                  ORDER BY COALESCE(disc_number, 1), track_number, filename",
@@ -163,6 +198,8 @@ impl Catalog {
                     disc: row.get(3)?,
                     number: row.get(4)?,
                     duration_seconds: row.get(5)?,
+                    rating: row.get::<_, Option<i64>>(8)?.filter(|&rating| rating > 0),
+                    loved: row.get::<_, Option<String>>(9)?.as_deref() == Some("L"),
                     path: Path::new(&directory).join(&filename),
                 })
             })
