@@ -4,7 +4,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.13.0** browses and searches your library, shows a wall of album covers, plays music, rates and loves tracks (also with Windows-wide shortcuts), and keeps itself up to date.
+Version **0.14.0** browses and searches your library, shows a wall of album covers, plays music, rates and loves tracks (also with Windows-wide shortcuts), counts your plays together with Aurora and Music Library, and keeps itself up to date.
 
 ## What it does
 
@@ -51,7 +51,13 @@ Version **0.13.0** browses and searches your library, shows a wall of album cove
   The rating keys are on the numeric keypad, with Num Lock on. Love is saved like a rating, into the MP3 first (MusicBee's `LOVE RATING` tag, `L`) and then into Music Library; the now-playing bar shows a heart for the playing track. Windows lets only one program own a shortcut, so **don't run Aurora and Aurora NG at the same time**: whichever starts second can't use the keys, and Aurora NG then names the ones it couldn't get in the now-playing bar. Close the other program and restart Aurora NG to get them back.
 - **Find an artist**: start typing a name anywhere in the window ("pink f") to jump to the first matching artist (not while typing in the search box).
 - **Play**: double-click an album to play it from the start, or double-click a track to play the album from that track. The album plays through to the end.
-- **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds.
+- **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds. On the right, **Your registered plays** and **Your listening time** show how often you have played the track and for how long, as in Aurora.
+- **Listening history, shared with Aurora and Music Library**: a play registers once you have listened to 30 seconds of a track (or all of it, when it is shorter), the same rule as Aurora. Only listening counts: pausing stops the clock, and seeking ahead adds nothing. The plays and listening time shown add up every history:
+  - Aurora NG's own, in `%LOCALAPPDATA%\aurora_ng\aurora-history.sqlite3`. It uses Aurora's history format, under its own device name (`aurora-ng-<computer>`), and is never mixed into Aurora's file.
+  - Aurora's on this computer (`%APPDATA%\com.soundtrackgeek.aurora\aurora-history.sqlite3`) and Music Library's player (Tonehavn), read live but never written.
+  - Every other computer's history in `%USERPROFILE%\OneDrive\_musicbackup` (`aurora-history-*.sqlite3`, and `tonehavn-history`).
+
+  Aurora NG publishes its own history there as `aurora-history-aurora-ng-<computer>.sqlite3`, at most once a minute while playing and when it closes, so Aurora counts Aurora NG's plays in its inspector, reports and history too. If the local file is lost, the next start restores it from that copy. Registered plays also go to Music Library's listening history through its bridge (`recordPlays`, every 2 minutes, retried later when Music Library can't be reached); Music Library ignores plays it already has from Aurora, so nothing is counted twice. Which plays have been sent is kept in `%LOCALAPPDATA%\aurora_ng\library-plays.json`. Aurora's played-threshold setting is per device; Aurora NG always uses 30 seconds.
 - **Space** plays or pauses.
 - **Updates**: the app checks for a new release when it starts and every 30 minutes after that. Click **Check for updates** in the header to check right away. When a new version is out, click **Update to vX.Y.Z** to download it, replace the app and restart.
 

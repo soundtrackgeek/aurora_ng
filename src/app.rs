@@ -4,6 +4,7 @@
 use crate::{
     audio::Audio,
     covers::{self, CoverIndex},
+    history::{History, Outcome, Session, Stats, TrackInfo},
     library::{Album, Artist, Catalog, Track, catalog_path},
     music_library,
     rating::{self, Change, Love, PendingRating, Stars, Values},
@@ -244,9 +245,18 @@ pub struct AuroraApp {
     /// The album that is playing, which stays put while you browse elsewhere.
     queue: Vec<Track>,
     queue_album: SharedString,
+    /// The playing album's genre, saved with each listen.
+    queue_genre: Option<String>,
     current: Option<usize>,
     playback_error: Option<String>,
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The listening history shared with Aurora and Music Library.
+    history: Option<History>,
+    /// The listen to the track playing now.
+    session: Option<Session>,
+    /// The playing track's plays and listening time before this listen.
+    track_stats: Option<(String, Stats)>,
+    _stats_task: Option<Task<()>>,
 
     type_ahead: String,
     type_ahead_at: Instant,
@@ -298,6 +308,7 @@ impl AuroraApp {
             this.update(cx, |this, _| {
                 this.window_bounds = Some(window.window_bounds());
                 this.current_settings().save();
+                this.close_history();
             })
             .ok();
             true
@@ -414,9 +425,14 @@ impl AuroraApp {
             audio: Audio::new(),
             queue: Vec::new(),
             queue_album: SharedString::default(),
+            queue_genre: None,
             current: None,
             playback_error: None,
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
+            history: History::open().ok(),
+            session: None,
+            track_stats: None,
+            _stats_task: None,
             type_ahead: String::new(),
             type_ahead_at: Instant::now(),
             _ticker: ticker,
@@ -1228,12 +1244,17 @@ impl AuroraApp {
     fn play_from(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.queue = self.tracks.clone();
         self.queue_album = self.selected_album_title();
+        self.queue_genre = match (self.selected_artist, self.selected_album) {
+            (Some(artist), Some(album)) => self.artists[artist].albums[album].genre.clone(),
+            _ => None,
+        };
         self.start(ix, cx);
     }
 
     /// Starts queue entry `ix`, skipping forward past files that cannot be played.
     fn start(&mut self, ix: usize, cx: &mut Context<Self>) {
         cx.notify();
+        self.end_session(Outcome::Skipped);
         let audio = match &self.audio {
             Ok(audio) => audio,
             Err(error) => {
@@ -1246,6 +1267,7 @@ impl AuroraApp {
                 Ok(()) => {
                     self.current = Some(offset);
                     self.playback_error = None;
+                    self.begin_session(cx);
                     return;
                 }
                 Err(error) => self.playback_error = Some(error),
@@ -1279,7 +1301,9 @@ impl AuroraApp {
             return;
         };
         if ix == 0 || audio.position() > Duration::from_secs(3) {
+            let position = audio.position();
             audio.seek(Duration::ZERO);
+            self.after_seek(position, Duration::ZERO);
             cx.notify();
         } else {
             self.start(ix - 1, cx);
@@ -1298,7 +1322,10 @@ impl AuroraApp {
             return;
         }
         let fraction = ((x - bounds.origin.x) / bounds.size.width).clamp(0., 1.);
-        audio.seek(Duration::from_secs_f32(fraction * seconds as f32));
+        let position = audio.position();
+        let target = Duration::from_secs_f32(fraction * seconds as f32);
+        audio.seek(target);
+        self.after_seek(position, target);
         cx.notify();
     }
 
@@ -1315,13 +1342,99 @@ impl AuroraApp {
             return;
         }
         if audio.is_finished() {
+            if let Some(mut session) = self.session.take()
+                && let Some(history) = &self.history
+            {
+                history.save(session.complete());
+            }
             if ix + 1 < self.queue.len() {
                 self.start(ix + 1, cx);
             } else {
                 self.current = None;
             }
+        } else {
+            let position = audio.position().as_secs_f64();
+            if let (Some(session), Some(history)) = (&mut self.session, &self.history)
+                && let Some(checkpoint) = session.observe(position)
+            {
+                history.save(checkpoint);
+            }
         }
         cx.notify();
+    }
+
+    // ── Listening history ───────────────────────────────────────────────
+
+    /// Starts counting a listen to the track that just started, and looks up
+    /// its plays so far.
+    fn begin_session(&mut self, cx: &mut Context<Self>) {
+        let (Some(history), Some(track)) = (&self.history, self.current_track()) else {
+            return;
+        };
+        let session = history.start_session(TrackInfo::new(
+            track,
+            &self.queue_album,
+            self.queue_genre.as_deref(),
+        ));
+        let key = session.track_key().to_owned();
+        let answer = history.track_stats(key.clone(), Some(session.id().to_owned()));
+        self.session = Some(session);
+        self._stats_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(stats) = answer.recv().await {
+                this.update(cx, |this, cx| {
+                    this.track_stats = Some((key, stats));
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// Saves the listen to the track that is stopping.
+    fn end_session(&mut self, outcome: Outcome) {
+        if let (Some(session), Some(history)) = (self.session.take(), &self.history) {
+            history.save(session.finish(outcome));
+        }
+    }
+
+    /// Counts playback up to the seek, but not the distance jumped.
+    fn after_seek(&mut self, from: Duration, to: Duration) {
+        if let (Some(session), Some(history)) = (&mut self.session, &self.history) {
+            if let Some(checkpoint) = session.observe(from.as_secs_f64()) {
+                history.save(checkpoint);
+            }
+            session.reset_position(to.as_secs_f64());
+        }
+    }
+
+    /// When the app closes: the listen so far is saved, and OneDrive gets
+    /// the latest history.
+    fn close_history(&mut self) {
+        if let (Ok(audio), Some(session), Some(history)) =
+            (&self.audio, &mut self.session, &self.history)
+            && !audio.is_paused()
+            && let Some(checkpoint) = session.observe(audio.position().as_secs_f64())
+        {
+            history.save(checkpoint);
+        }
+        self.end_session(Outcome::Interrupted);
+        if let Some(history) = &mut self.history {
+            history.shutdown(Duration::from_secs(5));
+        }
+    }
+
+    /// The playing track's registered plays and listening time, this listen
+    /// included; `None` while they are being looked up.
+    fn listening_stats(&self) -> Option<Stats> {
+        let session = self.session.as_ref()?;
+        let (key, before) = self.track_stats.as_ref()?;
+        if key != session.track_key() {
+            return None;
+        }
+        Some(Stats {
+            plays: before.plays + i64::from(session.registered()),
+            listened_seconds: before.listened_seconds + session.listened_seconds(),
+        })
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2633,6 +2746,30 @@ impl AuroraApp {
                             .child(div().w(px(44.)).child(clock(total))),
                     ),
             )
+            .when(track.is_some() && self.history.is_some(), |bar| {
+                let stats = self.listening_stats();
+                bar.child(
+                    div()
+                        .flex_none()
+                        .w(px(190.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_xs()
+                        .child(stat_row(
+                            "Your registered plays",
+                            stats.map_or("—".to_owned(), |stats| {
+                                thousands(stats.plays.max(0) as usize)
+                            }),
+                        ))
+                        .child(stat_row(
+                            "Your listening time",
+                            stats.map_or("—".to_owned(), |stats| {
+                                clock(stats.listened_seconds.round() as i64)
+                            }),
+                        )),
+                )
+            })
             .when_some(self.rating_status_line(), |bar, (text, text_color)| {
                 bar.child(
                     div()
@@ -2830,6 +2967,16 @@ fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) 
                 .hover(|style| style.bg(rgb(color::HOVER)))
         })
         .child(label.into())
+}
+
+/// A label and its value on one line, like Aurora's inspector.
+fn stat_row(label: &'static str, value: String) -> Div {
+    div()
+        .flex()
+        .justify_between()
+        .gap_3()
+        .child(div().text_color(rgb(color::MUTED)).child(label))
+        .child(div().text_color(rgb(color::TEXT)).child(value))
 }
 
 /// Whole and half stars filled in for a 0–100 rating (20 per star); all

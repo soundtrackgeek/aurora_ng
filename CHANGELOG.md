@@ -2,6 +2,15 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.14.0] - 2026-11-11
+
+### Added
+
+- **Your registered plays** and **Your listening time** for the playing track in the now-playing bar, as in Aurora's inspector. They count every play: Aurora NG's own, Aurora's on this computer, Music Library's player (Tonehavn), and other computers' histories in `OneDrive\_musicbackup`, and they update live while the track plays.
+- Aurora NG keeps a listening history the way Aurora does: a play registers after 30 seconds of listening (or the whole track, when it is shorter), and only forward playback counts, so seeking ahead adds nothing. It uses Aurora's history format in `%LOCALAPPDATA%\aurora_ng\aurora-history.sqlite3`, under its own device (`aurora-ng-<computer>`).
+- The history is published as `aurora-history-aurora-ng-<computer>.sqlite3` in `OneDrive\_musicbackup` (at most once a minute while playing, and on close), so Aurora shows Aurora NG's plays too. A new install on the same computer starts from that copy.
+- Registered plays are sent to Music Library's listening history through its `recordPlays` bridge operation, as Aurora sends them; plays Music Library already has from Aurora are ignored, so nothing is counted twice.
+
 ## [0.13.0] - 2026-11-11
 
 ### Added

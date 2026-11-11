@@ -1,6 +1,6 @@
 [package]
 name = "aurora_ng"
-version = "0.13.0"
+version = "0.14.0"
 description = "Aurora rebuilt natively with Rust and GPUI: browse the library and play music"
 authors = ["Jørn Tillnes"]
 edition = "2024"

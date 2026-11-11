@@ -4,6 +4,7 @@
 mod app;
 mod audio;
 mod covers;
+mod history;
 mod id3_write;
 mod install;
 mod library;

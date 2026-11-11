@@ -22,6 +22,7 @@ const PROTOCOL_VERSION: u32 = 1;
 const EXECUTABLE_ENV: &str = "AURORA_MUSIC_LIBRARY_EXE";
 const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(30);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const RECORD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 static EXCHANGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -68,6 +69,42 @@ pub fn sync_file(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// One registered play, as Aurora sends it to Music Library's listening history.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPlay {
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    /// Unix seconds when the play started.
+    pub played_at: i64,
+    pub file_path: Option<String>,
+}
+
+/// Adds plays to Music Library's listening history. Plays it already has
+/// (from Aurora, say) are ignored, so sending one twice is harmless.
+pub fn record_plays(plays: &[LibraryPlay]) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        plays: &'a [LibraryPlay],
+    }
+    let executable = executable()?;
+    invoke::<_, serde_json::Value>(
+        &executable,
+        "recordPlays",
+        Payload { plays },
+        RECORD_TIMEOUT,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        if error.contains("Unknown Aurora bridge operation") {
+            "Music Library is too old to take plays; update it (0.187.0 or newer).".to_owned()
+        } else {
+            error
+        }
+    })
+}
+
 /// Whether a failed sync is worth trying again soon: Music Library was busy
 /// or not reachable, rather than refusing the file.
 pub fn is_temporary(error: &str) -> bool {
@@ -110,7 +147,7 @@ fn executable() -> Result<PathBuf, String> {
     };
     if !path.is_file() {
         return Err(format!(
-            "Music Library was not found at {}; install it so ratings reach its catalog.",
+            "Music Library was not found at {}; install it so ratings and plays reach its catalog.",
             path.display()
         ));
     }
