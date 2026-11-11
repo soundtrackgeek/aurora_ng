@@ -1,6 +1,6 @@
 [package]
 name = "aurora_ng"
-version = "0.6.0"
+version = "0.7.0"
 description = "Aurora rebuilt natively with Rust and GPUI: browse the library and play music"
 authors = ["Jørn Tillnes"]
 edition = "2024"
@@ -22,3 +22,6 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[build-dependencies]
+embed-resource = "3"

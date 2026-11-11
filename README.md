@@ -1,8 +1,10 @@
 # Aurora NG
 
+<img src="assets/app-icon/aurora_ng.png" alt="Aurora NG icon" width="128">
+
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.4.0** browses your library, shows a wall of album covers, plays music, and keeps itself up to date.
+Version **0.7.0** browses your library, shows a wall of album covers, plays music, and keeps itself up to date.
 
 ## What it does
 
@@ -51,6 +53,18 @@ cargo run --release
 ```
 
 The first build compiles GPUI and takes several minutes. Run the tests with `cargo test`.
+
+## App icon
+
+The icon (aurora curtains over a night sky, with a pair of music notes) is built into the exe, so Explorer, the Start Menu, the taskbar and the window all show it. `build.rs` embeds `assets/app-icon/aurora_ng.ico` together with the app's name and version, which Windows shows in the file's Properties and in Task Manager.
+
+The icon is drawn by a script. To change it, edit `assets/app-icon/generate.py` and run it from the repository root (needs Python with Pillow and numpy):
+
+```powershell
+python assets/app-icon/generate.py
+```
+
+It writes the `.ico` (10 sizes, 16 to 256 pixels; the smallest ones are simplified so they stay sharp), a 1024-pixel `aurora_ng.png`, and `preview.png` with every size side by side for checking by eye.
 
 ## Releasing
 

@@ -2,7 +2,14 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
-## [0.6.0] - 2026-11-11
+## [0.7.0] - 2026-11-11
+
+### Added
+
+- An app icon: aurora curtains in the app's teal, violet and pink over a night sky, with a pair of music notes. It is built into the exe, so the Start Menu, taskbar, Explorer and the window's title bar show it. Small sizes use a simpler drawing so they stay sharp.
+- The exe now carries its name and version ("Aurora NG", 0.7.0), shown in its Properties and in Task Manager instead of "aurora_ng.exe".
+
+ - 2026-11-11
 
 ### Added
 
