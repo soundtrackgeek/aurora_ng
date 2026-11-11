@@ -145,6 +145,18 @@ pub struct AuroraApp {
     search_task: Option<Task<()>>,
     /// Stops a search the catalog is still running when a newer one starts.
     search_interrupt: Option<InterruptHandle>,
+    /// Whether the search filters the albums, rather than only sorting them.
+    filtered: bool,
+    /// The cover wall's order from `sort:`; the wall lists artist by artist
+    /// without one.
+    sort: Option<search::Sort>,
+    /// The draw `sort:random` shows; a new seed shuffles again.
+    shuffle_seed: u64,
+    /// Wall position → album, counting albums artist by artist. Empty
+    /// without a sort.
+    wall_order: Vec<usize>,
+    /// The other way round: album → wall position.
+    wall_position: Vec<usize>,
     _search_events: Subscription,
 
     /// Where each artist's albums start in the cover wall, which lists every
@@ -294,6 +306,11 @@ impl AuroraApp {
             search_state: SearchState::Idle,
             search_task: None,
             search_interrupt: None,
+            filtered: false,
+            sort: None,
+            shuffle_seed: settings.shuffle_seed.unwrap_or_else(search::new_seed),
+            wall_order: Vec::new(),
+            wall_position: Vec::new(),
             _search_events: search_events,
             album_offsets: Vec::new(),
             covers_found: Ok(0),
@@ -392,7 +409,7 @@ impl AuroraApp {
             }
         }
 
-        let ix = self.album_offsets[artist] + album;
+        let ix = self.wall_index(artist, album);
         if self.cover_wall && self.restore.details_open {
             self.open_details(ix);
         }
@@ -448,6 +465,7 @@ impl AuroraApp {
                 LoadState::Ready => self.search.clone().unwrap_or_default(),
                 _ => self.restore.search.clone(),
             },
+            shuffle_seed: Some(self.shuffle_seed),
             window,
         }
     }
@@ -478,7 +496,12 @@ impl AuroraApp {
                     }));
                 }
             }
-            InputEvent::Submit => self.run_search(cx),
+            InputEvent::Submit => {
+                // Enter on a random sort that is already shown draws again.
+                if !self.run_search(cx) && self.sort == Some(search::Sort::Random) {
+                    self.reshuffle(cx);
+                }
+            }
             // Esc clears the search; a second Esc leaves the box.
             InputEvent::Cancel => {
                 if self.search_text(cx).is_empty() {
@@ -497,17 +520,18 @@ impl AuroraApp {
         self.search_input.read(cx).text().to_owned()
     }
 
-    /// Searches for what is in the box now, unless those albums are already shown.
-    fn run_search(&mut self, cx: &mut Context<Self>) {
+    /// Searches for what is in the box now, unless those albums are already
+    /// shown. False when there was nothing new to search for.
+    fn run_search(&mut self, cx: &mut Context<Self>) -> bool {
         if !matches!(self.load_state, LoadState::Ready) {
-            return;
+            return false;
         }
         let query = self.search_text(cx).trim().to_owned();
         match &self.search_state {
-            SearchState::Searching(running) if *running == query => return,
+            SearchState::Searching(running) if *running == query => return false,
             SearchState::Idle if self.search.as_deref().unwrap_or("") == query => {
                 self.search_task = None;
-                return;
+                return false;
             }
             _ => {}
         }
@@ -517,26 +541,29 @@ impl AuroraApp {
         }
         cx.notify();
 
-        let parsed = match search::parse(&query) {
+        let parsed = search::split_sort(&query)
+            .and_then(|(filter, sort)| search::parse(&filter).map(|parsed| (parsed, sort)));
+        let (parsed, sort) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.search_state = SearchState::Failed(error);
-                return;
+                return true;
             }
         };
         if parsed.is_empty() {
+            // Nothing to filter, though there may be a sort.
             self.search_state = SearchState::Idle;
-            if self.search.take().is_some() {
-                self.show_matches(None, cx);
-            }
-            return;
+            self.search = (!query.is_empty()).then_some(query);
+            self.sort = sort;
+            self.show_matches(None, cx);
+            return true;
         }
         // A connection of its own, so the search runs off the UI thread.
         let catalog = match catalog_path().and_then(|path| Catalog::open(&path)) {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.search_state = SearchState::Failed(error);
-                return;
+                return true;
             }
         };
         self.search_interrupt = Some(catalog.interrupt_handle());
@@ -546,14 +573,16 @@ impl AuroraApp {
             .spawn(async move { catalog.search_album_ids(&parsed) });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
-            this.update(cx, |this, cx| this.finish_search(query, result, cx))
+            this.update(cx, |this, cx| this.finish_search(query, sort, result, cx))
                 .ok();
         }));
+        true
     }
 
     fn finish_search(
         &mut self,
         query: String,
+        sort: Option<search::Sort>,
         result: Result<HashSet<String>, String>,
         cx: &mut Context<Self>,
     ) {
@@ -567,6 +596,7 @@ impl AuroraApp {
             Ok(ids) => {
                 self.search_state = SearchState::Idle;
                 self.search = Some(query);
+                self.sort = sort;
                 self.show_matches(Some(&ids), cx);
             }
             Err(error) => self.search_state = SearchState::Failed(error),
@@ -612,29 +642,17 @@ impl AuroraApp {
                 })
                 .collect(),
         };
+        self.filtered = ids.is_some();
         self.set_artists(artists);
-
-        // Covers are kept by wall position, and every position changed.
-        for (_, cover) in self.covers.drain() {
-            match cover {
-                Cover::Ready { image, .. }
-                | Cover::Loading {
-                    previous: Some(image),
-                    ..
-                } => self.stale_images.push(image),
-                _ => {}
-            }
-        }
-        self.open_album = None;
-        self.reveal_details = 0;
-        self.reset_wall_items();
+        self.update_wall_order();
+        self.forget_wall();
 
         match selected_id.and_then(|id| self.find_album(&id)) {
             Some((artist, album)) => {
                 // Its tracks are already loaded.
                 self.selected_artist = Some(artist);
                 self.selected_album = Some(album);
-                let ix = self.album_offsets[artist] + album;
+                let ix = self.wall_index(artist, album);
                 if details_were_open && self.cover_wall {
                     self.open_details(ix);
                 }
@@ -655,6 +673,45 @@ impl AuroraApp {
             }
         }
         cx.notify();
+    }
+
+    /// A new draw for `sort:random`, seen from the top of the wall.
+    fn reshuffle(&mut self, cx: &mut Context<Self>) {
+        self.shuffle_seed = search::new_seed();
+        self.update_wall_order();
+        self.forget_wall();
+        self.scroll_wall_to_album(0);
+        cx.notify();
+    }
+
+    /// Works out the wall order for the sort, if there is one.
+    fn update_wall_order(&mut self) {
+        self.wall_order = match self.sort {
+            Some(sort) => search::wall_order(&self.artists, sort, self.shuffle_seed),
+            None => Vec::new(),
+        };
+        self.wall_position = vec![0; self.wall_order.len()];
+        for (position, &album) in self.wall_order.iter().enumerate() {
+            self.wall_position[album] = position;
+        }
+    }
+
+    /// After the wall's albums moved: drops the covers, which are kept by
+    /// wall position, and closes the details.
+    fn forget_wall(&mut self) {
+        for (_, cover) in self.covers.drain() {
+            match cover {
+                Cover::Ready { image, .. }
+                | Cover::Loading {
+                    previous: Some(image),
+                    ..
+                } => self.stale_images.push(image),
+                _ => {}
+            }
+        }
+        self.open_album = None;
+        self.reveal_details = 0;
+        self.reset_wall_items();
     }
 
     /// Shows these artists, and works out where their albums are on the wall.
@@ -736,7 +793,7 @@ impl AuroraApp {
             self.select_artist(ix, cx);
             self.artist_scroll.scroll_to_item(ix, ScrollStrategy::Top);
             if self.cover_wall {
-                self.scroll_wall_to_album(self.album_offsets[ix]);
+                self.scroll_wall_to_album(self.wall_index(ix, 0));
             }
         }
     }
@@ -748,7 +805,7 @@ impl AuroraApp {
         // Keep the selected album in view when switching.
         if let (Some(artist), Some(album)) = (self.selected_artist, self.selected_album) {
             if self.cover_wall {
-                self.scroll_wall_to_album(self.album_offsets[artist] + album);
+                self.scroll_wall_to_album(self.wall_index(artist, album));
             } else {
                 self.artist_scroll
                     .scroll_to_item(artist, ScrollStrategy::Center);
@@ -761,8 +818,15 @@ impl AuroraApp {
 
     /// The artist and album at position `ix` on the wall.
     fn wall_album(&self, ix: usize) -> (usize, usize) {
-        let artist = self.album_offsets.partition_point(|&start| start <= ix) - 1;
-        (artist, ix - self.album_offsets[artist])
+        let album = self.wall_order.get(ix).copied().unwrap_or(ix);
+        let artist = self.album_offsets.partition_point(|&start| start <= album) - 1;
+        (artist, album - self.album_offsets[artist])
+    }
+
+    /// Where an artist's album is on the wall.
+    fn wall_index(&self, artist: usize, album: usize) -> usize {
+        let album = self.album_offsets[artist] + album;
+        self.wall_position.get(album).copied().unwrap_or(album)
     }
 
     /// The number of rows of covers.
@@ -1257,7 +1321,7 @@ impl AuroraApp {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = match &self.load_state {
             LoadState::Loading => "Loading library…".into(),
-            LoadState::Ready if self.search.is_some() => format!(
+            LoadState::Ready if self.filtered => format!(
                 "{} of {} albums · {} artists",
                 thousands(self.album_count),
                 thousands(self.library_album_count),
@@ -1328,7 +1392,7 @@ impl AuroraApp {
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_text = !self.search_input.read(cx).text().is_empty();
         let state = match &self.search_state {
-            SearchState::Idle if self.search.is_some() && self.album_count == 0 => {
+            SearchState::Idle if self.filtered && self.album_count == 0 => {
                 Some(("No albums match".to_owned(), color::MUTED))
             }
             SearchState::Idle => None,
@@ -1348,6 +1412,17 @@ impl AuroraApp {
                     .min_w(px(160.))
                     .max_w(px(560.))
                     .child(self.search_input.clone()),
+            )
+            .when(
+                self.sort == Some(search::Sort::Random)
+                    && matches!(self.search_state, SearchState::Idle),
+                |row| {
+                    row.child(
+                        text_button("shuffle", "Shuffle", false).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.reshuffle(cx)),
+                        ),
+                    )
+                },
             )
             .when(has_text, |row| {
                 row.child(text_button("clear-search", "Clear", false).on_click(

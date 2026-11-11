@@ -4,7 +4,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.10.0** browses and searches your library, shows a wall of album covers, plays music, and keeps itself up to date.
+Version **0.11.0** browses and searches your library, shows a wall of album covers, plays music, and keeps itself up to date.
 
 ## What it does
 
@@ -21,6 +21,18 @@ Version **0.10.0** browses and searches your library, shows a wall of album cove
   | `year:1980..1985 AND cr:..99 AND love:1.. NOT genre:scores OR soundtrack` | 1980–1985 albums, not fully rated, with at least one loved track, that are neither scores nor soundtracks |
 
   Fields: `artist:` (track artist), `aartist:` (album artist), `album:`, `title:`, `genre:`, `publisher:`, `country:`, `year:` (original year), `ryear:` (release year), `cr:` (rating completeness %), `love:` (loved tracks), `single:` (official singles), `minutes:`, `ar:` (album rating, 0–5), `bb:`, `uk:`, `vg:` (chart ranks), `born:`, `dead:`, `founded:`, `dissolved:`. Unquoted words match word beginnings; quotes match the whole value exactly. Combine with `AND` or a comma, `OR` (the value after it keeps the field: `year:1985 OR 1987`) and `NOT` or a leading `-`; operators must be uppercase. Ranges use `..` and include both ends: `year:1985..`, `cr:50..80`, `love:..3`. `genre:scores` stands for the film, TV and game score genres (Action, Animation, Comedy, Documentary, Drama, Fantasy, Horror, Sci-Fi, Thriller, TV, Video Game, Western, Anime). `sonic:` is not available, since it needs Aurora's audio analysis. A query that is not valid shows what is wrong next to the box.
+
+  **Sorting the cover wall** (Aurora NG only; Aurora has no `sort:`): add one `sort:` anywhere in the query, on its own or with a search, separated by a space, comma or `AND`, like `genre:scores sort:random` or `year:1980..1989, sort:..year`. It changes the order of the cover wall; the columns keep their artist order.
+
+  | Sort | Order |
+  | --- | --- |
+  | `sort:random` | Shuffled. Press **Enter** in the search box or click **Shuffle** for a new draw |
+  | `sort:year..` / `sort:..year` | Oldest first / newest first; albums without a year go last |
+  | `sort:album az` / `sort:album za` | Album title A–Z / Z–A (`sort:albums` works too) |
+  | `sort:aartist az` / `sort:aartist za` | Album artist A–Z / Z–A |
+  | `sort:az` / `sort:za` | Short for `sort:album az` / `sort:album za` |
+
+  Without `az` or `za`, `sort:album` and `sort:aartist` sort A–Z. Albums in the same year are ordered by artist, then title; albums with the same title by artist, then year. The shuffled order is remembered, so the app opens with the same draw after a restart.
 - **Find an artist**: start typing a name anywhere in the window ("pink f") to jump to the first matching artist (not while typing in the search box).
 - **Play**: double-click an album to play it from the start, or double-click a track to play the album from that track. The album plays through to the end.
 - **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds.

@@ -634,6 +634,163 @@ pub fn parse(input: &str) -> Result<Search, String> {
     Ok(Search { groups })
 }
 
+// ── Sorting ─────────────────────────────────────────────────────────────
+
+/// How the cover wall orders its albums. Aurora has no `sort:`; it is
+/// Aurora NG's own, and it does not filter anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sort {
+    Random,
+    /// Oldest first.
+    YearAscending,
+    /// Newest first.
+    YearDescending,
+    Album {
+        descending: bool,
+    },
+    AlbumArtist {
+        descending: bool,
+    },
+}
+
+const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az or sort:aartist za.";
+
+/// Takes the `sort:` clause out of a query, wherever it is, and returns the
+/// rest of the query with the sort. `sort:album` and `sort:aartist` may be
+/// followed by `az` or `za` after a space.
+pub fn split_sort(input: &str) -> Result<(String, Option<Sort>), String> {
+    let is_break = |ch: char| ch.is_whitespace() || ch == ',';
+    let mut rest = String::new();
+    let mut sort = None;
+    let mut quoted = false;
+    let mut ix = 0;
+    while let Some(ch) = input[ix..].chars().next() {
+        let tail = &input[ix..];
+        let at_word_start = input[..ix].chars().next_back().is_none_or(is_break);
+        let is_sort = !quoted
+            && at_word_start
+            && tail
+                .get(..4)
+                .is_some_and(|word| word.eq_ignore_ascii_case("sort"))
+            && matches!(tail[4..].chars().next(), Some(':' | '='));
+        if !is_sort {
+            if ch == '"' {
+                quoted = !quoted;
+            }
+            rest.push(ch);
+            ix += ch.len_utf8();
+            continue;
+        }
+
+        let after = &tail[5..];
+        let end = after.find(is_break).unwrap_or(after.len());
+        let value = after[..end].to_ascii_lowercase();
+        let mut consumed = 5 + end;
+        // An optional direction after `album` or `aartist`.
+        let mut descending = false;
+        if matches!(value.as_str(), "album" | "albums" | "aartist") {
+            let next = &after[end..];
+            let spaces = next.len() - next.trim_start_matches(char::is_whitespace).len();
+            let word_end = next[spaces..]
+                .find(is_break)
+                .map_or(next.len(), |end| spaces + end);
+            match next[spaces..word_end].to_ascii_lowercase().as_str() {
+                "az" => consumed += word_end,
+                "za" => {
+                    descending = true;
+                    consumed += word_end;
+                }
+                _ => {}
+            }
+        }
+        let parsed = match value.as_str() {
+            "random" => Sort::Random,
+            "year.." => Sort::YearAscending,
+            "..year" => Sort::YearDescending,
+            "az" => Sort::Album { descending: false },
+            "za" => Sort::Album { descending: true },
+            "album" | "albums" => Sort::Album { descending },
+            "aartist" => Sort::AlbumArtist { descending },
+            "" => return Err(format!("sort: needs a value. {SORT_HELP}")),
+            other => return Err(format!("Unknown sort \"{other}\". {SORT_HELP}")),
+        };
+        if sort.replace(parsed).is_some() {
+            return Err("Use one sort: per search.".to_owned());
+        }
+        ix += consumed;
+    }
+    Ok((rest, sort))
+}
+
+/// A seed for `sort:random`; a new one gives a new draw.
+pub fn new_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// The cover wall's order, as positions in the albums listed artist by
+/// artist (each artist's albums oldest first). The sorts are stable, so ties
+/// keep that order: same-year albums by artist then title, same titles by
+/// artist then year.
+pub fn wall_order(artists: &[crate::library::Artist], sort: Sort, seed: u64) -> Vec<usize> {
+    let albums: Vec<(&str, &crate::library::Album)> = artists
+        .iter()
+        .flat_map(|artist| {
+            artist
+                .albums
+                .iter()
+                .map(move |album| (artist.sort_key.as_str(), album))
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..albums.len()).collect();
+    match sort {
+        Sort::Random => shuffle(&mut order, seed),
+        Sort::YearAscending | Sort::YearDescending => {
+            let newest_first = sort == Sort::YearDescending;
+            // Albums without a year go last either way.
+            order.sort_by(|&a, &b| match (albums[a].1.year, albums[b].1.year) {
+                (Some(a), Some(b)) if newest_first => b.cmp(&a),
+                (Some(a), Some(b)) => a.cmp(&b),
+                (a, b) => b.is_some().cmp(&a.is_some()),
+            });
+        }
+        Sort::Album { descending } => {
+            let titles: Vec<String> = albums
+                .iter()
+                .map(|(_, album)| album.title.to_lowercase())
+                .collect();
+            order.sort_by(|&a, &b| {
+                let order = titles[a].cmp(&titles[b]);
+                if descending { order.reverse() } else { order }
+            });
+        }
+        // Already in artist order.
+        Sort::AlbumArtist { descending: false } => {}
+        Sort::AlbumArtist { descending: true } => {
+            order.sort_by(|&a, &b| albums[b].0.cmp(albums[a].0));
+        }
+    }
+    order
+}
+
+/// Fisher–Yates with SplitMix64: the same seed always gives the same order.
+fn shuffle(order: &mut [usize], seed: u64) {
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..order.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+}
+
 // ── SQL ─────────────────────────────────────────────────────────────────
 
 /// `column >= ? AND column <= ?` for the bounds that are set.
@@ -1000,6 +1157,99 @@ pub fn album_ids(connection: &Connection, search: &Search) -> Result<HashSet<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_the_sort_out_of_a_query() {
+        let split = |query: &str| split_sort(query).unwrap();
+        assert_eq!(split("sort:random"), (String::new(), Some(Sort::Random)));
+        assert_eq!(
+            split("year:1981 sort:az"),
+            (
+                "year:1981 ".to_owned(),
+                Some(Sort::Album { descending: false })
+            )
+        );
+        assert_eq!(
+            split("sort:aartist za, genre:scores"),
+            (
+                ", genre:scores".to_owned(),
+                Some(Sort::AlbumArtist { descending: true })
+            )
+        );
+        assert_eq!(
+            split("genre:rock AND sort=..year"),
+            ("genre:rock AND ".to_owned(), Some(Sort::YearDescending))
+        );
+        assert_eq!(
+            split("SORT:Albums ZA year:1999"),
+            (
+                " year:1999".to_owned(),
+                Some(Sort::Album { descending: true })
+            )
+        );
+        assert_eq!(
+            split("sort:album year:1999").1,
+            Some(Sort::Album { descending: false })
+        );
+        // Not a clause: inside quotes, or in the middle of a word.
+        assert_eq!(split("title:\"sort:az\"").1, None);
+        assert_eq!(split("aartist:resort:az").1, None);
+        assert!(parse(&split("year:1981 AND sort:year..").0).is_ok());
+
+        assert!(split_sort("sort:").is_err());
+        assert!(split_sort("sort:sideways").is_err());
+        assert!(split_sort("sort:az sort:za").is_err());
+    }
+
+    #[test]
+    fn orders_the_wall() {
+        use crate::library::{Album, Artist};
+        let album = |title: &str, year: Option<i64>| Album {
+            id: title.to_owned(),
+            title: title.to_owned(),
+            year,
+            publisher: None,
+            genre: None,
+            total_tracks: None,
+            total_seconds: None,
+            rating: None,
+            score: None,
+            folder: None,
+            cover: None,
+        };
+        let artist = |name: &str, albums: Vec<Album>| Artist {
+            name: name.to_owned(),
+            sort_key: name.to_lowercase(),
+            albums,
+        };
+        // Positions: 0 ABBA/Waterloo, 1 ABBA/Arrival, 2 Kiss/Destroyer, 3 Kiss/Unknown.
+        let artists = [
+            artist(
+                "ABBA",
+                vec![album("Waterloo", Some(1974)), album("Arrival", Some(1976))],
+            ),
+            artist(
+                "Kiss",
+                vec![album("Destroyer", Some(1976)), album("Unknown", None)],
+            ),
+        ];
+        let order = |sort| wall_order(&artists, sort, 7);
+        assert_eq!(order(Sort::YearAscending), [0, 1, 2, 3]);
+        assert_eq!(order(Sort::YearDescending), [1, 2, 0, 3]);
+        assert_eq!(order(Sort::Album { descending: false }), [1, 2, 3, 0]);
+        assert_eq!(order(Sort::Album { descending: true }), [0, 3, 2, 1]);
+        assert_eq!(order(Sort::AlbumArtist { descending: false }), [0, 1, 2, 3]);
+        assert_eq!(order(Sort::AlbumArtist { descending: true }), [2, 3, 0, 1]);
+
+        let mut shuffled = order(Sort::Random);
+        assert_eq!(
+            shuffled,
+            order(Sort::Random),
+            "the same seed, the same draw"
+        );
+        shuffled.sort();
+        assert_eq!(shuffled, [0, 1, 2, 3]);
+    }
 
     fn ids(connection: &Connection, query: &str) -> Vec<String> {
         let search = parse(query).unwrap();

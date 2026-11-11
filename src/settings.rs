@@ -24,6 +24,8 @@ pub struct Settings {
     pub track_id: Option<i64>,
     /// The search the albums were filtered by; empty for none.
     pub search: String,
+    /// The draw `sort:random` showed, so it comes back the same.
+    pub shuffle_seed: Option<u64>,
     pub window: Option<SavedWindow>,
 }
 
@@ -36,6 +38,7 @@ impl Default for Settings {
             details_open: false,
             track_id: None,
             search: String::new(),
+            shuffle_seed: None,
             window: None,
         }
     }
@@ -98,7 +101,8 @@ mod tests {
             album_id: Some("abc".to_owned()),
             details_open: true,
             track_id: Some(7),
-            search: "aartist:\"bon jovi\"".to_owned(),
+            search: "aartist:\"bon jovi\" sort:random".to_owned(),
+            shuffle_seed: Some(42),
             window: Some(SavedWindow {
                 x: 10.,
                 y: 20.,

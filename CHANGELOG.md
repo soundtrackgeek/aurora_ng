@@ -2,6 +2,13 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.11.0] - 2026-11-11
+
+### Added
+
+- `sort:` in the search box orders the cover wall: `sort:random`, `sort:year..` (oldest first), `sort:..year` (newest first), `sort:album az` / `za` (album title), `sort:aartist az` / `za` (album artist), and `sort:az` / `sort:za` as short forms for album title. It can go anywhere in a query, alone or with a search, like `genre:scores sort:random`. Aurora does not have it.
+- With `sort:random`, Enter in the search box or the new **Shuffle** button gives a new draw. The draw is remembered between runs.
+
 ## [0.10.0] - 2026-11-11
 
 ### Added
