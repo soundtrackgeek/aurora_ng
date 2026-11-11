@@ -2,6 +2,18 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.15.0] - 2026-11-11
+
+### Added
+
+- Album chart positions, as in Aurora: every album that charted shows its best position on Billboard, Official UK and VG Lista, each with its country's flag, under big covers and in the album details header.
+- Single chart positions after each track's title, in the album details and the Tracks column: BB (Billboard), UK (Official UK), VG (VG Lista), TI (Ti i Skuddet) and NT (Norsktoppen), read from the ranks Music Library stores for each track.
+- A disc after the title of tracks released as official singles, from Music Library's MusicBrainz-confirmed singles (`track_singles`, Music Library 0.210.0 or newer). Possible singles are left out, as in Aurora.
+
+### Changed
+
+- Big covers on the cover wall are one line taller, to fit the chart positions. The line is kept for albums that never charted, so the ratings in a row line up.
+
 ## [0.14.0] - 2026-11-11
 
 ### Added

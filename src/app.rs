@@ -17,7 +17,7 @@ use crate::{
 use gpui::{
     Bounds, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, ImageSource, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy, SharedString, Stateful,
+    MouseUpEvent, ObjectFit, Pixels, RenderImage, Resource, ScrollStrategy, SharedString, Stateful,
     Subscription, Task, UniformListScrollHandle, Window, WindowBounds, actions, canvas, div, img,
     list, prelude::*, px, relative, rgb, svg, uniform_list,
 };
@@ -50,8 +50,8 @@ const TILE_MIN_FOR_TEXT: f32 = 100.;
 const TILE_MIN_FOR_INFO: f32 = 300.;
 /// Room for the title and artist lines under a cover.
 const TILE_TEXT_HEIGHT: Pixels = px(52.);
-/// Room for the info and rating lines under the title on big covers.
-const TILE_INFO_HEIGHT: Pixels = px(44.);
+/// Room for the info, chart and rating lines under the title on big covers.
+const TILE_INFO_HEIGHT: Pixels = px(66.);
 /// Memory for thumbnails; the ones off screen longest are dropped past this.
 const COVER_MEMORY_BYTES: usize = 192 * 1024 * 1024;
 /// How long to wait before giving Music Library a rating again, when it was
@@ -77,6 +77,8 @@ pub(crate) mod color {
     pub const ERROR: u32 = 0xf87171;
     pub const STAR: u32 = 0xfbbf24;
     pub const LOVE: u32 = 0xf472b6;
+    /// Chart labels, like "BB" and "UK" after a track's title.
+    pub const CHART: u32 = 0xc084fc;
     /// Empty stars and hearts.
     pub const UNSET: u32 = 0x3a4052;
 }
@@ -2105,7 +2107,7 @@ impl AuroraApp {
                         row(ix, this.selected_track == Some(ix))
                             .when(playing, |row| row.text_color(rgb(color::ACCENT)))
                             .child(number)
-                            .child(truncated(track.title.clone()))
+                            .child(track_title(track).flex_1().min_w_0())
                             .when(album_artist != Some(track.artist.as_str()), |row| {
                                 row.child(
                                     div()
@@ -2307,6 +2309,8 @@ impl AuroraApp {
                             .text_color(rgb(color::MUTED))
                             .child(self.album_info(album)),
                     )
+                    // Kept when empty, so the ratings in a row line up.
+                    .child(album_charts(album).flex_none().h(px(18.)).text_xs())
                     .child(self.album_rating(album).text_xs())
                 })
             })
@@ -2440,6 +2444,9 @@ impl AuroraApp {
                         .text_color(rgb(color::MUTED))
                         .child(self.album_info(album)),
                 )
+                .when(!album.charts.is_empty(), |header| {
+                    header.child(album_charts(album))
+                })
                 .child(self.album_rating(album)),
         );
 
@@ -2524,7 +2531,7 @@ impl AuroraApp {
                         })),
                     [
                         number,
-                        div().child(track.title.clone()),
+                        track_title(track),
                         track_artist,
                         div()
                             .text_xs()
@@ -3022,6 +3029,68 @@ fn star_slot(filled: i64, size: Pixels, fill: u32) -> Div {
 /// 0–100 → half stars, 0 to 10.
 fn star_halves(rating: Option<i64>) -> i64 {
     rating.map_or(0, |rating| (rating.clamp(0, 100) + 5) / 10)
+}
+
+/// A track's title, then its chart peaks ("BB #2  UK #1") and a disc when it
+/// was released as a single. The title gives way first when space runs out.
+fn track_title(track: &Track) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().min_w_0().truncate().child(track.title.clone()))
+        .children(track.charts.iter().map(|peak| {
+            div()
+                .flex_none()
+                .flex()
+                .gap(px(3.))
+                .text_xs()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(color::CHART))
+                        .child(peak.chart.short_label()),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(color::MUTED))
+                        .child(format!("#{}", peak.rank)),
+                )
+        }))
+        .when(track.single, |title| {
+            title.child(
+                svg()
+                    .path("icons/disc.svg")
+                    .flex_none()
+                    .size(px(13.))
+                    .text_color(rgb(color::TEXT)),
+            )
+        })
+}
+
+/// An album's chart peaks, each a flag and its position: "🇺🇸 #1 🇬🇧 #1 🇳🇴 #3".
+fn album_charts(album: &Album) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .text_color(rgb(color::TEXT))
+        .children(album.charts.iter().map(|peak| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    img(ImageSource::Resource(Resource::Embedded(
+                        peak.chart.flag().into(),
+                    )))
+                    .w(px(16.))
+                    .h(px(12.))
+                    .flex_none()
+                    .rounded_xs(),
+                )
+                .child(format!("#{}", peak.rank))
+        }))
 }
 
 fn heart(loved: bool, size: Pixels) -> impl IntoElement {

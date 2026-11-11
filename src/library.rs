@@ -26,6 +26,71 @@ pub struct Album {
     pub folder: Option<String>,
     /// Filled in from the covers folder after loading.
     pub cover: Option<PathBuf>,
+    /// Best album chart positions: Billboard, Official UK, VG Lista.
+    pub charts: Vec<ChartPeak>,
+}
+
+/// The charts Music Library matches the library against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chart {
+    Billboard,
+    OfficialUk,
+    VgLista,
+    TiISkuddet,
+    Norsktoppen,
+}
+
+impl Chart {
+    /// Track charts, in the order Aurora shows them.
+    const SINGLES: [Chart; 5] = [
+        Chart::Billboard,
+        Chart::OfficialUk,
+        Chart::VgLista,
+        Chart::TiISkuddet,
+        Chart::Norsktoppen,
+    ];
+    /// Album charts, in the order Aurora shows them.
+    const ALBUMS: [Chart; 3] = [Chart::Billboard, Chart::OfficialUk, Chart::VgLista];
+
+    /// "BB", as Aurora labels a track's chart.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Chart::Billboard => "BB",
+            Chart::OfficialUk => "UK",
+            Chart::VgLista => "VG",
+            Chart::TiISkuddet => "TI",
+            Chart::Norsktoppen => "NT",
+        }
+    }
+
+    /// The flag Aurora shows for an album chart.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Chart::Billboard => "flags/us.svg",
+            Chart::OfficialUk => "flags/gb.svg",
+            Chart::VgLista | Chart::TiISkuddet | Chart::Norsktoppen => "flags/no.svg",
+        }
+    }
+}
+
+/// An album's or track's best position on one chart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChartPeak {
+    pub chart: Chart,
+    pub rank: i64,
+}
+
+/// The ranks Music Library stored, one column per chart, without the charts
+/// the album or track never reached.
+fn chart_peaks(charts: &[Chart], ranks: &[Option<i64>]) -> Vec<ChartPeak> {
+    charts
+        .iter()
+        .zip(ranks)
+        .filter_map(|(&chart, &rank)| {
+            rank.filter(|&rank| rank > 0)
+                .map(|rank| ChartPeak { chart, rank })
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -49,6 +114,11 @@ pub struct Track {
     pub rating: Option<i64>,
     pub loved: bool,
     pub path: PathBuf,
+    /// Best single chart positions: Billboard, Official UK, VG Lista, Ti i
+    /// Skuddet, Norsktoppen.
+    pub charts: Vec<ChartPeak>,
+    /// Released as an official single, as MusicBrainz confirms it.
+    pub single: bool,
 }
 
 impl Track {
@@ -77,6 +147,8 @@ pub fn catalog_path() -> Result<PathBuf, String> {
 
 pub struct Catalog {
     connection: Connection,
+    /// Music Library 0.210.0 and newer list official singles.
+    has_singles: bool,
 }
 
 impl Catalog {
@@ -95,7 +167,22 @@ impl Catalog {
             .pragma_update(None, "query_only", true)
             .map_err(|error| format!("Could not make the catalog read-only: {error}"))?;
         register_functions(&connection)?;
-        Ok(Self { connection })
+        Self::with_connection(connection)
+    }
+
+    fn with_connection(connection: Connection) -> Result<Self, String> {
+        let has_singles = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                               WHERE type = 'table' AND name = 'track_singles')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not read the catalog: {error}"))?;
+        Ok(Self {
+            connection,
+            has_singles,
+        })
     }
 
     /// Stops a query running on this connection from another thread.
@@ -119,7 +206,8 @@ impl Catalog {
                 "SELECT a.id, a.album, a.album_artist_display, a.year,
                         (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
                         a.publisher, a.total_tracks, a.total_seconds,
-                        a.effective_album_rating, a.album_score, a.canonical_genre
+                        a.effective_album_rating, a.album_score, a.canonical_genre,
+                        a.billboard_rank, a.official_uk_rank, a.vg_lista_rank
                  FROM albums a",
             )
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -137,6 +225,7 @@ impl Catalog {
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<f64>>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    chart_peaks(&Chart::ALBUMS, &[row.get(11)?, row.get(12)?, row.get(13)?]),
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -155,6 +244,7 @@ impl Catalog {
                 rating,
                 score,
                 genre,
+                charts,
             ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
@@ -178,6 +268,7 @@ impl Catalog {
                     score,
                     folder: non_empty(folder),
                     cover: None,
+                    charts,
                 });
         }
 
@@ -197,16 +288,30 @@ impl Catalog {
 
     /// The tracks of one album, in disc and track order.
     pub fn tracks(&self, album_id: &str) -> Result<Vec<Track>, String> {
+        // Music Library keys singles by `lower(trim(...))` of the album artist
+        // and title. Built here in SQLite too, the keys match byte for byte:
+        // SQLite's `lower` folds ASCII only, unlike Rust's.
+        let single = if self.has_singles {
+            "EXISTS(SELECT 1 FROM track_singles s
+                    WHERE s.artist_key = lower(trim(t.album_artist_display))
+                      AND s.track_key = lower(trim(t.title))
+                      AND s.confidence = 'confirmed')"
+        } else {
+            "0"
+        };
         let mut statement = self
             .connection
-            .prepare_cached(
-                "SELECT id, title, COALESCE(NULLIF(TRIM(display_artist), ''), album_artist_display),
-                        disc_number, track_number, time_seconds, file_path, filename,
-                        normalized_rating, love
-                 FROM tracks
-                 WHERE album_id = ?1
-                 ORDER BY COALESCE(disc_number, 1), track_number, filename",
-            )
+            .prepare_cached(&format!(
+                "SELECT t.id, t.title,
+                        COALESCE(NULLIF(TRIM(t.display_artist), ''), t.album_artist_display),
+                        t.disc_number, t.track_number, t.time_seconds, t.file_path, t.filename,
+                        t.normalized_rating, t.love,
+                        t.billboard_single_rank, t.official_uk_rank, t.vg_lista_rank,
+                        t.ti_i_skuddet_rank, t.norsktoppen_rank, {single}
+                 FROM tracks t
+                 WHERE t.album_id = ?1
+                 ORDER BY COALESCE(t.disc_number, 1), t.track_number, t.filename"
+            ))
             .map_err(|error| format!("Could not read tracks: {error}"))?;
         statement
             .query_map([album_id], |row| {
@@ -223,6 +328,17 @@ impl Catalog {
                     rating: row.get::<_, Option<i64>>(8)?.filter(|&rating| rating > 0),
                     loved: row.get::<_, Option<String>>(9)?.as_deref() == Some("L"),
                     path: Path::new(&directory).join(&filename),
+                    charts: chart_peaks(
+                        &Chart::SINGLES,
+                        &[
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                            row.get(14)?,
+                        ],
+                    ),
+                    single: row.get(15)?,
                 })
             })
             .map_err(|error| format!("Could not read tracks: {error}"))?
@@ -266,4 +382,111 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCHEMA: &str = "
+        CREATE TABLE albums (id TEXT PRIMARY KEY, album TEXT, album_artist_display TEXT,
+            year INTEGER, publisher TEXT, total_tracks INTEGER, total_seconds INTEGER,
+            effective_album_rating INTEGER, album_score REAL, canonical_genre TEXT,
+            billboard_rank INTEGER, official_uk_rank INTEGER, vg_lista_rank INTEGER);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id TEXT, title TEXT,
+            display_artist TEXT, album_artist_display TEXT, disc_number INTEGER,
+            track_number INTEGER, time_seconds INTEGER, file_path TEXT, filename TEXT,
+            normalized_rating INTEGER, love TEXT, billboard_single_rank INTEGER,
+            official_uk_rank INTEGER, vg_lista_rank INTEGER, ti_i_skuddet_rank INTEGER,
+            norsktoppen_rank INTEGER);
+        INSERT INTO albums (id, album, album_artist_display, billboard_rank, official_uk_rank,
+            vg_lista_rank) VALUES ('thriller', 'Thriller', 'Michael Jackson', 1, 1, 3),
+            ('bad', 'Bad', 'Michael Jackson', NULL, 0, NULL);
+        INSERT INTO tracks (id, album_id, title, album_artist_display, track_number, file_path,
+            filename, billboard_single_rank, official_uk_rank, vg_lista_rank, ti_i_skuddet_rank)
+            VALUES (1, 'thriller', 'Billie Jean', 'Michael Jackson', 6, 'D:\', '06.mp3', 2, 1, 5, 3),
+                   (2, 'thriller', 'Baby Be Mine', 'Michael Jackson', 2, 'D:\', '02.mp3', NULL, NULL, NULL, NULL),
+                   (3, 'thriller', ' Human Nature', 'Michael Jackson', 7, 'D:\', '07.mp3', 118, NULL, NULL, NULL);";
+
+    fn catalog(singles: bool) -> Catalog {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        if singles {
+            connection
+                .execute_batch(
+                    "CREATE TABLE track_singles (artist_key TEXT, track_key TEXT,
+                        confidence TEXT, PRIMARY KEY (artist_key, track_key));
+                     INSERT INTO track_singles VALUES
+                        ('michael jackson', 'billie jean', 'confirmed'),
+                        ('michael jackson', 'human nature', 'confirmed'),
+                        ('michael jackson', 'baby be mine', 'possible');",
+                )
+                .unwrap();
+        }
+        Catalog::with_connection(connection).unwrap()
+    }
+
+    #[test]
+    fn albums_carry_the_charts_they_reached() {
+        let artists = catalog(true).artists().unwrap();
+        let albums = &artists[0].albums;
+        let thriller = albums.iter().find(|album| album.id == "thriller").unwrap();
+        assert_eq!(
+            thriller.charts,
+            [
+                ChartPeak {
+                    chart: Chart::Billboard,
+                    rank: 1
+                },
+                ChartPeak {
+                    chart: Chart::OfficialUk,
+                    rank: 1
+                },
+                ChartPeak {
+                    chart: Chart::VgLista,
+                    rank: 3
+                },
+            ]
+        );
+        // A zero rank means the album never charted there.
+        let bad = albums.iter().find(|album| album.id == "bad").unwrap();
+        assert!(bad.charts.is_empty());
+    }
+
+    #[test]
+    fn tracks_carry_chart_peaks_and_confirmed_singles() {
+        let tracks = catalog(true).tracks("thriller").unwrap();
+        let summary: Vec<_> = tracks
+            .iter()
+            .map(|track| {
+                let labels: Vec<_> = track
+                    .charts
+                    .iter()
+                    .map(|peak| (peak.chart.short_label(), peak.rank))
+                    .collect();
+                (track.title.as_str(), labels, track.single)
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                // A possible single is not shown as one.
+                ("Baby Be Mine", vec![], false),
+                (
+                    "Billie Jean",
+                    vec![("BB", 2), ("UK", 1), ("VG", 5), ("TI", 3)],
+                    true
+                ),
+                // Keys are trimmed, as Music Library trims them.
+                ("Human Nature", vec![("BB", 118)], true),
+            ]
+        );
+    }
+
+    #[test]
+    fn older_catalogs_without_singles_still_load_tracks() {
+        let tracks = catalog(false).tracks("thriller").unwrap();
+        assert_eq!(tracks.len(), 3);
+        assert!(tracks.iter().all(|track| !track.single));
+    }
 }

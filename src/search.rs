@@ -1216,6 +1216,7 @@ mod tests {
             score: None,
             folder: None,
             cover: None,
+            charts: Vec::new(),
         };
         let artist = |name: &str, albums: Vec<Album>| Artist {
             name: name.to_owned(),
