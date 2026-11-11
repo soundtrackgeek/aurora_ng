@@ -6,12 +6,14 @@ mod audio;
 mod covers;
 mod install;
 mod library;
+mod settings;
 mod update;
 
 use gpui::{
     App, Application, AssetSource, Bounds, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions, prelude::*, px, size,
+    WindowOptions, point, prelude::*, px, size,
 };
+use settings::{SavedWindow, Settings};
 use std::borrow::Cow;
 
 /// The icons are compiled into the binary.
@@ -41,21 +43,53 @@ fn main() {
     if install::run() {
         return;
     }
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Aurora NG".into()),
+    let settings = Settings::load();
+    Application::new()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            let window_bounds = settings
+                .window
+                .and_then(|saved| saved_window_bounds(saved, cx))
+                .unwrap_or_else(|| {
+                    WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx))
+                });
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(window_bounds),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Aurora NG".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| app::AuroraApp::new(window, cx)),
-        )
-        .expect("could not open the Aurora window");
-        cx.on_window_closed(|cx| cx.quit()).detach();
-        cx.activate(true);
-    });
+                },
+                |window, cx| cx.new(|cx| app::AuroraApp::new(settings, window, cx)),
+            )
+            .expect("could not open the Aurora window");
+            cx.on_window_closed(|cx| cx.quit()).detach();
+            cx.activate(true);
+        });
+}
+
+/// Where the window was last time, unless that is no longer on any screen
+/// (like a monitor that has been unplugged).
+fn saved_window_bounds(saved: SavedWindow, cx: &App) -> Option<WindowBounds> {
+    if saved.width < 200. || saved.height < 150. {
+        return None;
+    }
+    let bounds = Bounds {
+        origin: point(px(saved.x), px(saved.y)),
+        size: size(px(saved.width), px(saved.height)),
+    };
+    let on_screen = cx
+        .displays()
+        .iter()
+        .any(|display| display.bounds().intersects(&bounds));
+    if !on_screen {
+        return None;
+    }
+    Some(if saved.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    })
 }

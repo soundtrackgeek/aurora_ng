@@ -5,13 +5,14 @@ use crate::{
     audio::Audio,
     covers::{self, CoverIndex},
     library::{Album, Artist, Catalog, Track, catalog_path},
+    settings::{self, SavedWindow, Settings},
     update::{self, Release},
 };
 use gpui::{
     Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, ListAlignment,
     ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     Pixels, RenderImage, ScrollStrategy, SharedString, Stateful, Task, UniformListScrollHandle,
-    Window, canvas, div, img, list, prelude::*, px, relative, rgb, svg, uniform_list,
+    Window, WindowBounds, canvas, div, img, list, prelude::*, px, relative, rgb, svg, uniform_list,
 };
 use std::{
     cell::Cell,
@@ -31,7 +32,6 @@ const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(1000);
 /// Cover wall tiles: the square cover, then two lines of text when there is room.
 const TILE_MIN: f32 = 50.;
 const TILE_MAX: f32 = 500.;
-const TILE_DEFAULT: f32 = 180.;
 /// Tiles narrower than this show only the cover.
 const TILE_MIN_FOR_TEXT: f32 = 100.;
 /// From this cover size, every cover shows its album's info under the title,
@@ -169,12 +169,29 @@ pub struct AuroraApp {
     update: UpdateState,
     /// Checks for updates at startup and then every 30 minutes.
     _update_checker: Task<()>,
+
+    /// The settings the app started with: the album to go back to once the
+    /// library has loaded, and what to save if it closes before then.
+    restore: Settings,
+    /// Where the window is, kept so the settings can be saved without it.
+    window_bounds: Option<WindowBounds>,
 }
 
 impl AuroraApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+
+        // Remember how everything looks for next time.
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |this, _| {
+                this.window_bounds = Some(window.window_bounds());
+                this.current_settings().save();
+            })
+            .ok();
+            true
+        });
 
         // Reading 74k albums takes a moment, so it happens off the UI thread.
         let loading = cx.background_executor().spawn(async move {
@@ -233,13 +250,17 @@ impl AuroraApp {
             album_count: 0,
             album_offsets: Vec::new(),
             covers_found: Ok(0),
-            cover_wall: false,
+            cover_wall: settings.cover_wall,
             wall_list: ListState::new(0, ListAlignment::Top, px(600.)),
             open_album: None,
             reveal_details: 0,
             wall_columns: 1,
             wall_row_height: px(0.),
-            tile_size: TILE_DEFAULT,
+            tile_size: if settings.cover_size.is_finite() {
+                settings.cover_size.clamp(TILE_MIN, TILE_MAX)
+            } else {
+                settings::DEFAULT_COVER_SIZE
+            },
             thumbnail_size: covers::THUMBNAIL_SIZES[0],
             dragging_size: false,
             size_slider_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -266,6 +287,8 @@ impl AuroraApp {
             _ticker: ticker,
             update: UpdateState::Idle,
             _update_checker: update_checker,
+            restore: settings,
+            window_bounds: None,
         }
     }
 
@@ -290,13 +313,94 @@ impl AuroraApp {
                 self.artists = artists;
                 self.load_state = LoadState::Ready;
                 self.reset_wall_items();
-                if !self.artists.is_empty() {
+                if !self.restore_album(cx) && !self.artists.is_empty() {
                     self.select_artist(0, cx);
                 }
             }
             Err(error) => self.load_state = LoadState::Failed(error),
         }
         cx.notify();
+    }
+
+    // ── Settings ────────────────────────────────────────────────────────
+
+    /// Goes back to the album that was selected when the app last closed,
+    /// with its details open again if they were. False if it is gone.
+    fn restore_album(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.restore.album_id.as_deref() else {
+            return false;
+        };
+        let Some((artist, album)) = self.artists.iter().enumerate().find_map(|(ix, artist)| {
+            let album = artist.albums.iter().position(|album| album.id == id)?;
+            Some((ix, album))
+        }) else {
+            return false;
+        };
+        self.selected_artist = Some(artist);
+        self.select_album(album, cx);
+
+        if let Some(track_id) = self.restore.track_id {
+            self.selected_track = self.tracks.iter().position(|track| track.id == track_id);
+            if let Some(track) = self.selected_track {
+                self.track_scroll
+                    .scroll_to_item(track, ScrollStrategy::Center);
+            }
+        }
+
+        let ix = self.album_offsets[artist] + album;
+        if self.cover_wall && self.restore.details_open {
+            self.open_details(ix);
+        }
+        self.scroll_wall_to_album(ix);
+        self.artist_scroll
+            .scroll_to_item(artist, ScrollStrategy::Center);
+        self.album_scroll
+            .scroll_to_item(album, ScrollStrategy::Center);
+        true
+    }
+
+    /// How the app looks right now, to open the same way next time.
+    fn current_settings(&self) -> Settings {
+        // Until the library has loaded, keep the album from last time.
+        let (album_id, details_open, track_id) = if matches!(self.load_state, LoadState::Ready) {
+            (
+                self.selected_artist
+                    .zip(self.selected_album)
+                    .map(|(artist, album)| self.artists[artist].albums[album].id.clone()),
+                self.open_album.is_some(),
+                self.selected_track
+                    .and_then(|ix| self.tracks.get(ix))
+                    .map(|track| track.id),
+            )
+        } else {
+            (
+                self.restore.album_id.clone(),
+                self.restore.details_open,
+                self.restore.track_id,
+            )
+        };
+        let window = match self.window_bounds {
+            Some(bounds) => {
+                let maximized = !matches!(bounds, WindowBounds::Windowed(_));
+                let bounds = bounds.get_bounds();
+                Some(SavedWindow {
+                    x: f32::from(bounds.origin.x),
+                    y: f32::from(bounds.origin.y),
+                    width: f32::from(bounds.size.width),
+                    height: f32::from(bounds.size.height),
+                    maximized,
+                })
+            }
+            None => self.restore.window,
+        };
+        Settings {
+            cover_wall: self.cover_wall,
+            cover_size: self.tile_size,
+            album_id,
+            details_open,
+            track_id,
+            window,
+        }
     }
 
     // ── Browsing ────────────────────────────────────────────────────────
@@ -669,6 +773,8 @@ impl AuroraApp {
             return;
         };
         let release = release.clone();
+        // The new version starts before this one quits, so save now.
+        self.current_settings().save();
         self.update = UpdateState::Installing(release.clone());
         cx.notify();
         let installing = cx
@@ -1655,6 +1761,7 @@ impl AuroraApp {
 
 impl Render for AuroraApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_bounds = Some(window.window_bounds());
         self.tidy_covers(window);
         let body = match &self.load_state {
             LoadState::Loading => message("Loading your library…".to_owned(), color::MUTED),

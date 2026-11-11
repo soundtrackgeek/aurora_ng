@@ -2,20 +2,30 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.9.0] - 2026-11-11
+
+### Added
+
+- The app remembers how it looked when it was closed and opens the same way: cover wall or columns, the cover size, the selected album and track, whether the album's details were open, and the window's position, size and maximized state. The album is scrolled into view, and if it is no longer in the library the app starts at the first artist. Settings are saved in `%LOCALAPPDATA%\aurora_ng\settings.json`, also just before an update restarts the app.
+
+### Changed
+
+- The first time it starts, the app opens on the cover wall with 500-pixel covers, instead of the columns with 180-pixel covers.
+
 ## [0.8.0] - 2026-11-11
 
 ### Added
 
 - The app installs itself: the first time the downloaded `aurora_ng-windows-x64.exe` runs, it copies itself to `%LOCALAPPDATA%\Programs\Aurora NG\Aurora NG.exe`, adds an **Aurora NG** shortcut to the Start Menu, and starts from there. It now shows as "Aurora NG" in Start Menu search and can be pinned to Start and the taskbar. If the shortcut is removed, the installed app puts it back the next time it starts.
 
- - 2026-11-11
+## [0.7.0] - 2026-11-11
 
 ### Added
 
 - An app icon: aurora curtains in the app's teal, violet and pink over a night sky, with a pair of music notes. It is built into the exe, so the Start Menu, taskbar, Explorer and the window's title bar show it. Small sizes use a simpler drawing so they stay sharp.
 - The exe now carries its name and version ("Aurora NG", 0.7.0), shown in its Properties and in Task Manager instead of "aurora_ng.exe".
 
- - 2026-11-11
+## [0.6.0] - 2026-11-11
 
 ### Added
 
