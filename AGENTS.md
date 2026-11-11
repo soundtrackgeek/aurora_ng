@@ -17,3 +17,9 @@
    - Use `git add` to stage all modified files (README.md, CHANGELOG.md, and code files)
    - Create descriptive commit message following existing style
    - Push to remote repository with `git push`
+
+4. **Release**: when the version number changed, tag the commit and push the tag to publish a GitHub Release (the in-app updater picks it up):
+   - `git tag vX.Y.Z` (must match `version` in `Cargo.toml`)
+   - `git push origin vX.Y.Z`
+
+5. **Clean up**: after every push, run `cargo clean` to free the disk space used by `target/`.

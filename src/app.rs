@@ -3,6 +3,7 @@
 use crate::{
     audio::Audio,
     library::{Artist, Catalog, Track, catalog_path},
+    update::{self, Release},
 };
 use gpui::{
     Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -33,6 +34,15 @@ mod color {
     pub const ACCENT_HOVER: u32 = 0x99f6e4;
     pub const BAR: u32 = 0x2a2f3f;
     pub const ERROR: u32 = 0xf87171;
+}
+
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Installing(Release),
+    Failed(String),
 }
 
 enum LoadState {
@@ -68,6 +78,10 @@ pub struct AuroraApp {
     type_ahead: String,
     type_ahead_at: Instant,
     _ticker: Task<()>,
+
+    update: UpdateState,
+    /// Checks for updates at startup and then every 30 minutes.
+    _update_checker: Task<()>,
 }
 
 impl AuroraApp {
@@ -97,6 +111,18 @@ impl AuroraApp {
             }
         });
 
+        let update_checker = cx.spawn(async move |this, cx| {
+            loop {
+                if this
+                    .update(cx, |this, cx| this.check_for_updates(cx))
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(update::CHECK_INTERVAL).await;
+            }
+        });
+
         Self {
             focus_handle,
             load_state: LoadState::Loading,
@@ -120,6 +146,8 @@ impl AuroraApp {
             type_ahead: String::new(),
             type_ahead_at: Instant::now(),
             _ticker: ticker,
+            update: UpdateState::Idle,
+            _update_checker: update_checker,
         }
     }
 
@@ -193,6 +221,60 @@ impl AuroraApp {
             self.select_artist(ix, cx);
             self.artist_scroll.scroll_to_item(ix, ScrollStrategy::Top);
         }
+    }
+
+    // ── Updates ─────────────────────────────────────────────────────────
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.update,
+            UpdateState::Checking | UpdateState::Installing(_)
+        ) {
+            return;
+        }
+        self.update = UpdateState::Checking;
+        cx.notify();
+        let checking = cx.background_executor().spawn(async { update::check() });
+        cx.spawn(async move |this, cx| {
+            let result = checking.await;
+            this.update(cx, |this, cx| {
+                // An install may have started while the check was running.
+                if matches!(this.update, UpdateState::Checking) {
+                    this.update = match result {
+                        Ok(Some(release)) => UpdateState::Available(release),
+                        Ok(None) => UpdateState::UpToDate,
+                        Err(error) => UpdateState::Failed(error),
+                    };
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Available(release) = &self.update else {
+            return;
+        };
+        let release = release.clone();
+        self.update = UpdateState::Installing(release.clone());
+        cx.notify();
+        let installing = cx
+            .background_executor()
+            .spawn(async move { update::install(&release).and_then(|()| update::relaunch()) });
+        cx.spawn(async move |this, cx| {
+            let result = installing.await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => cx.quit(),
+                Err(error) => {
+                    this.update = UpdateState::Failed(error);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ── Playback ────────────────────────────────────────────────────────
@@ -330,7 +412,40 @@ impl AuroraApp {
 
     // ── Rendering ───────────────────────────────────────────────────────
 
-    fn render_header(&self) -> impl IntoElement {
+    fn render_update(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let check_button = || {
+            text_button("check-updates", "Check for updates", false)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.check_for_updates(cx)))
+        };
+        let row = div().flex().items_center().gap_2().text_xs();
+        match &self.update {
+            UpdateState::Idle => row.child(check_button()),
+            UpdateState::Checking => row.child(muted("Checking for updates…")),
+            UpdateState::UpToDate => row.child(muted("Up to date")).child(check_button()),
+            UpdateState::Available(release) => row.child(
+                text_button(
+                    "install-update",
+                    format!("Update to v{}", release.version),
+                    true,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx))),
+            ),
+            UpdateState::Installing(release) => {
+                row.child(muted(format!("Installing v{}…", release.version)))
+            }
+            UpdateState::Failed(error) => row
+                .child(
+                    div()
+                        .max_w(px(360.))
+                        .truncate()
+                        .text_color(rgb(color::ERROR))
+                        .child(error.clone()),
+                )
+                .child(check_button()),
+        }
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = match &self.load_state {
             LoadState::Loading => "Loading library…".into(),
             LoadState::Ready => format!(
@@ -351,11 +466,25 @@ impl AuroraApp {
             .border_color(rgb(color::BORDER))
             .child(
                 div()
-                    .text_color(rgb(color::ACCENT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Aurora"),
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(rgb(color::ACCENT))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Aurora"),
+                    )
+                    .child(muted(concat!("v", env!("CARGO_PKG_VERSION")))),
             )
-            .child(div().text_sm().text_color(rgb(color::MUTED)).child(status))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(div().text_sm().text_color(rgb(color::MUTED)).child(status))
+                    .child(self.render_update(cx)),
+            )
     }
 
     fn render_artists(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -642,7 +771,7 @@ impl Render for AuroraApp {
             .text_color(rgb(color::TEXT))
             .font_family("Segoe UI")
             .text_sm()
-            .child(self.render_header())
+            .child(self.render_header(cx))
             .child(div().flex_1().min_h_0().child(body))
             .child(self.render_now_playing(cx))
     }
@@ -746,6 +875,31 @@ fn icon_button(id: &'static str, icon: &'static str, primary: bool) -> Stateful<
                     color::TEXT
                 })),
         )
+}
+
+fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .text_xs()
+        .when(primary, |button| {
+            button
+                .bg(rgb(color::ACCENT))
+                .text_color(rgb(color::BACKGROUND))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .hover(|style| style.bg(rgb(color::ACCENT_HOVER)))
+        })
+        .when(!primary, |button| {
+            button
+                .border_1()
+                .border_color(rgb(color::BORDER))
+                .text_color(rgb(color::TEXT))
+                .hover(|style| style.bg(rgb(color::HOVER)))
+        })
+        .child(label.into())
 }
 
 /// 245 → "4:05", 3725 → "1:02:05".

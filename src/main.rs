@@ -4,6 +4,7 @@
 mod app;
 mod audio;
 mod library;
+mod update;
 
 use gpui::{
     App, Application, AssetSource, Bounds, SharedString, TitlebarOptions, WindowBounds,

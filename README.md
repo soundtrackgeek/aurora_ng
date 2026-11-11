@@ -2,7 +2,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.1.0** does two things: browse your library and play music.
+Version **0.2.0** browses your library, plays music, and keeps itself up to date.
 
 ## What it does
 
@@ -11,6 +11,11 @@ Version **0.1.0** does two things: browse your library and play music.
 - **Play**: double-click an album to play it from the start, or double-click a track to play the album from that track. The album plays through to the end.
 - **Now playing bar**: previous, play/pause and next buttons, plus elapsed and total time. Click the progress bar to jump to that point in the track. **Previous** restarts the track, or goes back one track during its first 3 seconds.
 - **Space** plays or pauses.
+- **Updates**: the app checks for a new release when it starts and every 30 minutes after that. Click **Check for updates** in the header to check right away. When a new version is out, click **Update to vX.Y.Z** to download it, replace the app and restart.
+
+## Download
+
+Get `aurora_ng-windows-x64.exe` from the [latest release](https://github.com/soundtrackgeek/aurora_ng/releases/latest) and run it. There is no installer; the app updates itself in place.
 
 ## Your library
 
@@ -33,3 +38,12 @@ cargo run --release
 ```
 
 The first build compiles GPUI and takes several minutes. Run the tests with `cargo test`.
+
+## Releasing
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`):
+
+1. Bump `version` in `Cargo.toml` and add the matching section to `CHANGELOG.md`.
+2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The workflow checks that the tag matches `Cargo.toml`, runs the tests, builds the release exe and publishes it with that version's changelog notes. Running apps pick it up within 30 minutes.
