@@ -13,6 +13,7 @@ pub struct Album {
     /// The original year, not the release year of a reissue.
     pub year: Option<i64>,
     pub publisher: Option<String>,
+    pub genre: Option<String>,
     pub total_tracks: Option<i64>,
     pub total_seconds: Option<i64>,
     /// 0–100, like track ratings: the explicit album rating, or the mean of
@@ -101,7 +102,7 @@ impl Catalog {
                 "SELECT a.id, a.album, a.album_artist_display, a.year,
                         (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
                         a.publisher, a.total_tracks, a.total_seconds,
-                        a.effective_album_rating, a.album_score
+                        a.effective_album_rating, a.album_score, a.canonical_genre
                  FROM albums a",
             )
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -118,6 +119,7 @@ impl Catalog {
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -135,6 +137,7 @@ impl Catalog {
                 total_seconds,
                 rating,
                 score,
+                genre,
             ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
@@ -151,6 +154,7 @@ impl Catalog {
                     title: non_empty(title).unwrap_or_else(|| "Unknown Album".to_owned()),
                     year,
                     publisher: non_empty(publisher),
+                    genre: non_empty(genre),
                     total_tracks,
                     total_seconds,
                     rating,

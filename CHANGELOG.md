@@ -2,6 +2,17 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.6.0] - 2026-11-11
+
+### Added
+
+- Covers 300 pixels or wider show two more lines under the title and artist, without clicking: genre · label · track count · length (like "Action · Varese Sarabande · 15 tracks · 40:09"), then the average rating in stars and the Album Score (like "★★★½ 3.60 · Album Score: 3.60"). The details panel then leaves this info out.
+
+### Changed
+
+- On smaller covers, the details panel header is laid out like Aurora's album detail: a small cover next to the title, artist and year, the info line and the rating line, instead of labeled columns.
+- Average rating and Album Score show two decimals, as in Aurora.
+
 ## [0.5.0] - 2026-11-11
 
 ### Added

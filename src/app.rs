@@ -4,7 +4,7 @@
 use crate::{
     audio::Audio,
     covers::{self, CoverIndex},
-    library::{Artist, Catalog, Track, catalog_path},
+    library::{Album, Artist, Catalog, Track, catalog_path},
     update::{self, Release},
 };
 use gpui::{
@@ -34,8 +34,13 @@ const TILE_MAX: f32 = 500.;
 const TILE_DEFAULT: f32 = 180.;
 /// Tiles narrower than this show only the cover.
 const TILE_MIN_FOR_TEXT: f32 = 100.;
+/// From this cover size, every cover shows its album's info under the title,
+/// and the details panel leaves it out.
+const TILE_MIN_FOR_INFO: f32 = 300.;
 /// Room for the title and artist lines under a cover.
 const TILE_TEXT_HEIGHT: Pixels = px(52.);
+/// Room for the info and rating lines under the title on big covers.
+const TILE_INFO_HEIGHT: Pixels = px(44.);
 /// Memory for thumbnails; the ones off screen longest are dropped past this.
 const COVER_MEMORY_BYTES: usize = 192 * 1024 * 1024;
 
@@ -1045,7 +1050,12 @@ impl AuroraApp {
         let tile = px(self.tile_size);
         let gap = px((self.tile_size * 0.1).clamp(6., 18.));
         let show_text = self.tile_size >= TILE_MIN_FOR_TEXT;
-        let row_height = gap + tile + if show_text { TILE_TEXT_HEIGHT } else { px(0.) };
+        let text_height = match (show_text, self.info_under_cover()) {
+            (false, _) => px(0.),
+            (true, false) => TILE_TEXT_HEIGHT,
+            (true, true) => TILE_TEXT_HEIGHT + TILE_INFO_HEIGHT,
+        };
+        let row_height = gap + tile + text_height;
         self.thumbnail_size = covers::thumbnail_size(self.tile_size * window.scale_factor());
 
         let width = window.viewport_size().width;
@@ -1130,6 +1140,7 @@ impl AuroraApp {
             Some(year) => format!("{} · {year}", artist.name),
             None => artist.name.clone(),
         };
+        let show_info = show_text && self.info_under_cover();
 
         let artwork = div()
             .size(tile)
@@ -1194,6 +1205,17 @@ impl AuroraApp {
                         .text_color(rgb(color::MUTED))
                         .child(subtitle),
                 )
+                .when(show_info, |tile| {
+                    tile.child(
+                        div()
+                            .flex_none()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(color::MUTED))
+                            .child(self.album_info(album)),
+                    )
+                    .child(self.album_rating(album).text_xs())
+                })
             })
             // A click opens or closes the album's details; a double-click plays it.
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
@@ -1211,6 +1233,51 @@ impl AuroraApp {
                 }
                 cx.notify();
             }))
+    }
+
+    /// Big covers leave room for the open album's info under the cover.
+    fn info_under_cover(&self) -> bool {
+        self.tile_size >= TILE_MIN_FOR_INFO
+    }
+
+    /// "Action · Varese Sarabande · 15 tracks · 40:09", leaving out what is unknown.
+    fn album_info(&self, album: &Album) -> String {
+        // From the catalog's album totals: covers show this before their
+        // tracks are loaded.
+        let seconds = album.total_seconds.filter(|&total| total > 0);
+        [
+            album.genre.clone(),
+            album.publisher.clone(),
+            album
+                .total_tracks
+                .map(|tracks| format!("{tracks} {}", if tracks == 1 { "track" } else { "tracks" })),
+            seconds.map(clock),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    /// "★★★½ 3.60 · Album Score: 3.60".
+    fn album_rating(&self, album: &Album) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_color(rgb(color::MUTED))
+            .child(stars(album.rating, px(13.)))
+            .child(match album.rating {
+                Some(rating) => format!("{:.2}", rating as f32 / 20.),
+                None => "Not rated".to_owned(),
+            })
+            .child("·")
+            .child(format!(
+                "Album Score: {}",
+                album
+                    .score
+                    .map_or_else(|| "—".to_owned(), |score| format!("{score:.2}"))
+            ))
     }
 
     /// The open album's details: what it is, then its tracks.
@@ -1236,59 +1303,55 @@ impl AuroraApp {
             Some(year) => format!("{} · {year}", artist.name),
             None => artist.name.clone(),
         };
-        let seconds = album.total_seconds.or_else(|| {
-            let total: i64 = self
-                .tracks
-                .iter()
-                .filter_map(|track| track.duration_seconds)
-                .sum();
-            Some(total).filter(|&total| total > 0)
-        });
-        let track_count = album.total_tracks.unwrap_or(self.tracks.len() as i64);
-        let rating = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(stars(album.rating, px(14.)))
-            .child(match album.rating {
-                Some(rating) => format!("{:.1}", rating as f32 / 20.),
-                None => "Not rated".to_owned(),
+        let thumbnail = match self.covers.get(&ix) {
+            Some(Cover::Ready { image, .. }) => Some(image.clone()),
+            Some(Cover::Loading { previous, .. }) => previous.clone(),
+            _ => None,
+        };
+        let artwork = div()
+            .size(px(112.))
+            .flex_none()
+            .rounded_md()
+            .overflow_hidden()
+            .bg(rgb(color::BACKGROUND))
+            .when_some(thumbnail, |artwork, image| {
+                artwork.child(
+                    img(ImageSource::Render(image))
+                        .size_full()
+                        .object_fit(ObjectFit::Cover),
+                )
             });
-        let stats = div()
-            .flex()
-            .flex_wrap()
-            .gap_x_8()
-            .gap_y_3()
-            .child(stat("Tracks", track_count.to_string()))
-            .child(stat(
-                "Length",
-                seconds.map(clock).unwrap_or_else(|| "—".into()),
-            ))
-            .child(stat(
-                "Label",
-                album.publisher.clone().unwrap_or_else(|| "—".into()),
-            ))
-            .child(stat("Average rating", rating))
-            .child(stat(
-                "Album score",
-                album
-                    .score
-                    .map(|score| format!("{score:.1}"))
-                    .unwrap_or_else(|| "—".into()),
-            ));
-        let header = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(album.title.clone()),
-            )
-            .child(div().text_color(rgb(color::MUTED)).child(subtitle));
+        let header = div().flex().items_center().gap_5().child(artwork).child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(album.title.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(rgb(color::MUTED))
+                        .child(subtitle),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(rgb(color::MUTED))
+                        .child(self.album_info(album)),
+                )
+                .child(self.album_rating(album)),
+        );
 
-        let panel = panel.child(header).child(stats);
+        // Big covers already show this under the cover.
+        let panel = panel.when(!self.info_under_cover(), |panel| panel.child(header));
         if let Some(error) = &self.tracks_error {
             return panel.child(div().text_color(rgb(color::ERROR)).child(error.clone()));
         }
@@ -1766,21 +1829,6 @@ fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) 
                 .hover(|style| style.bg(rgb(color::HOVER)))
         })
         .child(label.into())
-}
-
-/// A label over a value, for the album details.
-fn stat(label: &'static str, value: impl IntoElement) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(color::MUTED))
-                .child(label.to_uppercase()),
-        )
-        .child(div().min_h(px(20.)).flex().items_center().child(value))
 }
 
 /// Whole and half stars filled in for a 0–100 rating (20 per star); all
