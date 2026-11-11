@@ -1,6 +1,6 @@
 [package]
 name = "aurora_ng"
-version = "0.12.0"
+version = "0.13.0"
 description = "Aurora rebuilt natively with Rust and GPUI: browse the library and play music"
 authors = ["Jørn Tillnes"]
 edition = "2024"
@@ -8,6 +8,7 @@ rust-version = "1.95"
 
 [dependencies]
 anyhow = "1"
+async-channel = "2.5.0"
 gpui = "0.2.2"
 id3 = "1.17.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }

@@ -2,6 +2,17 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.13.0] - 2026-11-11
+
+### Added
+
+- Windows-wide shortcuts with the same keys as Aurora, working while another program has focus: Ctrl+Alt+P plays or pauses, Ctrl+Alt+N skips to the next track, Ctrl+Alt+Num 1 to Num 5 rate the playing track, Ctrl+Alt+Num 0 clears its rating, and Ctrl+Alt+L toggles its Love. If another program (such as Aurora) already has some of the keys, the now-playing bar says which.
+- Toggle Love works as in Aurora: it writes MusicBee's `LOVE RATING` tag (`L`) into the MP3 with the same verified, atomic save as ratings, or removes it; a banned track becomes loved. Music Library then re-reads the file. The now-playing bar shows a heart for the playing track.
+
+### Changed
+
+- Rating and Love from the keyboard always go to the track that is playing, never to the one selected in the window. Ctrl+0 to Ctrl+5 no longer rate the selected track; clicking stars still rates any track.
+
 ## [0.12.0] - 2026-11-11
 
 ### Added

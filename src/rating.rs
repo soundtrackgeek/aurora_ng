@@ -1,17 +1,18 @@
-//! Track ratings, stored in the MP3 the way Aurora and MusicBee store them: a
-//! POPM frame owned by "MusicBee". Aurora NG only sets whole stars, one to
-//! five, or clears the rating.
+//! Track ratings and Love, stored in the MP3 the way Aurora and MusicBee
+//! store them: the rating as a POPM frame owned by "MusicBee", Love as a
+//! `LOVE RATING` TXXX frame ("L" loved, "B" banned). Aurora NG only sets
+//! whole stars, one to five, or clears the rating, and toggles Love.
 //!
 //! A save never touches the MP3 in place. It writes a hidden working copy in
-//! the same folder, checks that the rating reads back, that every other frame
-//! and the audio itself are unchanged, and then swaps it in with one atomic
-//! replace. The ratings saved but not yet in Music Library's catalog are kept
-//! in `%LOCALAPPDATA%\aurora_ng\pending-ratings.json` until it has them.
+//! the same folder, checks that the new values read back, that every other
+//! frame and the audio itself are unchanged, and then swaps it in with one
+//! atomic replace. Changes saved but not yet in Music Library's catalog are
+//! kept in `%LOCALAPPDATA%\aurora_ng\pending-ratings.json` until it has them.
 
 use crate::id3_write::write_tag_preserving_frames;
 use id3::{
     Tag, TagLike, Version,
-    frame::{Content, Frame, Unknown},
+    frame::{Content, ExtendedText, Frame, Unknown},
     no_tag_ok,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,51 @@ const MUSICBEE_BYTES: [(i64, u8); 10] = [
 ];
 const LEGACY_DEFAULT_BYTES: [(i64, u8); 5] =
     [(20, 51), (40, 102), (60, 153), (80, 204), (100, 255)];
+/// MusicBee's Love field; read in any case, written like this.
+const LOVE_DESCRIPTION: &str = "LOVE RATING";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Love {
+    Neutral,
+    Loved,
+    Banned,
+}
+
+/// The values a save can change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Values {
+    /// 0–100, or `None` when there is no rating.
+    pub rating: Option<i64>,
+    pub love: Love,
+}
+
+/// What a save changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Whole stars, or `None` to clear the rating.
+    Rating(Option<Stars>),
+    /// Loved becomes neutral; neutral or banned becomes loved, as in Aurora.
+    ToggleLove,
+}
+
+impl Change {
+    fn apply(self, values: Values) -> Values {
+        match self {
+            Self::Rating(stars) => Values {
+                rating: stars.map(Stars::points),
+                ..values
+            },
+            Self::ToggleLove => Values {
+                love: if values.love == Love::Loved {
+                    Love::Neutral
+                } else {
+                    Love::Loved
+                },
+                ..values
+            },
+        }
+    }
+}
 
 /// A rating that can be set: one to five whole stars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,24 +116,28 @@ impl Stars {
     }
 }
 
-/// Sets the MP3's rating, or clears it with `None`. Does nothing when the
-/// file already has that rating.
-pub fn write_rating(path: &Path, stars: Option<Stars>) -> Result<(), String> {
+/// Makes `change` to the MP3, starting from the values it has now, and
+/// returns the values it has after. Does nothing when nothing would change.
+pub fn save(path: &Path, change: Change) -> Result<Values, String> {
     if !path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
     {
-        return Err("Only MP3 files can be rated.".to_owned());
+        return Err("Only MP3 files can be rated or loved.".to_owned());
     }
-    let desired = stars.map(Stars::points);
     let original = Fingerprint::read(path)?;
     let (mut tag, version) = read_tag(path)?;
-    if read_rating(&tag)? == desired {
-        return Ok(());
+    let before = read_values(&tag)?;
+    let desired = change.apply(before);
+    if desired == before {
+        return Ok(before);
     }
     let preserved = other_frames(&tag);
     let audio = audio_payload_hash(path)?;
-    set_rating(&mut tag, version, stars);
+    match change {
+        Change::Rating(stars) => set_rating(&mut tag, version, stars),
+        Change::ToggleLove => set_love(&mut tag, desired.love),
+    }
 
     let working = sibling_path(path, "working.tmp")?;
     let backup = sibling_path(path, "original.backup")?;
@@ -100,14 +150,12 @@ pub fn write_rating(path: &Path, stars: Option<Stars>) -> Result<(), String> {
             .write(true)
             .open(&working)
             .and_then(|file| file.sync_all())
-            .map_err(|error| format!("Could not flush the rated copy: {error}"))?;
+            .map_err(|error| format!("Could not flush the changed copy: {error}"))?;
         verify(&working, desired, &preserved, &audio)?;
         // Keeps other programs from writing to the MP3 until it is replaced.
         let _exclusion = open_write_exclusion(path)?;
         if Fingerprint::read(path)? != original {
-            return Err(
-                "The MP3 changed while its rating was saved; it was left as it was.".to_owned(),
-            );
+            return Err("The MP3 changed while it was saved; it was left as it was.".to_owned());
         }
         replace_file(path, &working, Some(&backup))
     })();
@@ -119,22 +167,81 @@ pub fn write_rating(path: &Path, stars: Option<Stars>) -> Result<(), String> {
     if let Err(error) = verify(path, desired, &preserved, &audio) {
         return match replace_file(path, &backup, None) {
             Ok(()) => Err(format!(
-                "The saved rating could not be verified, so the original MP3 was put back: {error}"
+                "The saved MP3 could not be verified, so the original was put back: {error}"
             )),
             Err(restore) => Err(format!(
-                "The saved rating could not be verified ({error}), and the original could not be put back; it is kept at {}: {restore}",
+                "The saved MP3 could not be verified ({error}), and the original could not be put back; it is kept at {}: {restore}",
                 backup.display()
             )),
         };
     }
     let _ = fs::remove_file(&backup);
-    Ok(())
+    Ok(desired)
 }
 
-/// The MP3's rating, 0–100, or `None` when it has none.
 #[cfg(test)]
-fn read_rating_from_path(path: &Path) -> Result<Option<i64>, String> {
-    read_rating(&read_tag(path)?.0)
+fn read_values_from_path(path: &Path) -> Result<Values, String> {
+    read_values(&read_tag(path)?.0)
+}
+
+fn read_values(tag: &Tag) -> Result<Values, String> {
+    Ok(Values {
+        rating: read_rating(tag)?,
+        love: read_love(tag)?,
+    })
+}
+
+fn is_love_text(text: &ExtendedText) -> bool {
+    text.description.eq_ignore_ascii_case(LOVE_DESCRIPTION)
+}
+
+/// Love the way Aurora reads it: one `LOVE RATING` field, "L" or "B".
+fn read_love(tag: &Tag) -> Result<Love, String> {
+    let values: Vec<&str> = tag
+        .extended_texts()
+        .filter(|text| is_love_text(text))
+        .map(|text| {
+            text.value
+                .trim_start()
+                .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
+        })
+        .collect();
+    if values.len() > 1 {
+        return Err("This MP3 has more than one Love field; it was left as it was.".to_owned());
+    }
+    match values.first().copied().unwrap_or_default() {
+        "" => Ok(Love::Neutral),
+        "L" => Ok(Love::Loved),
+        "B" => Ok(Love::Banned),
+        _ => {
+            Err("This MP3 has a Love value Aurora does not know; it was left as it was.".to_owned())
+        }
+    }
+}
+
+/// Replaces the Love field, keeping every other TXXX frame.
+fn set_love(tag: &mut Tag, love: Love) {
+    let kept: Vec<Frame> = tag
+        .remove("TXXX")
+        .into_iter()
+        .filter(|frame| !is_love_frame(frame))
+        .collect();
+    for frame in kept {
+        tag.add_frame(frame);
+    }
+    let value = match love {
+        Love::Neutral => return,
+        Love::Loved => "L",
+        Love::Banned => "B",
+    };
+    tag.add_frame(ExtendedText {
+        description: LOVE_DESCRIPTION.to_owned(),
+        value: value.to_owned(),
+    });
+}
+
+fn is_love_frame(frame: &Frame) -> bool {
+    frame.content().extended_text().is_some_and(is_love_text)
 }
 
 fn read_tag(path: &Path) -> Result<(Tag, Version), String> {
@@ -231,22 +338,22 @@ fn is_rating_frame(frame: &Frame) -> bool {
 
 fn other_frames(tag: &Tag) -> Vec<Frame> {
     tag.frames()
-        .filter(|frame| !is_rating_frame(frame))
+        .filter(|frame| !is_rating_frame(frame) && !is_love_frame(frame))
         .cloned()
         .collect()
 }
 
-/// The written file has the rating, every other frame as before, and the
-/// same audio.
+/// The written file has the new values, every other frame as before, and
+/// the same audio.
 fn verify(
     path: &Path,
-    expected: Option<i64>,
+    expected: Values,
     preserved: &[Frame],
     audio: &[u8; 32],
 ) -> Result<(), String> {
     let (tag, _) = read_tag(path)?;
-    if read_rating(&tag)? != expected {
-        return Err("the rating did not read back".to_owned());
+    if read_values(&tag)? != expected {
+        return Err("the new values did not read back".to_owned());
     }
     if !same_frames(&other_frames(&tag), preserved) {
         return Err("another tag changed".to_owned());
@@ -417,13 +524,17 @@ fn replace_file(target: &Path, replacement: &Path, backup: Option<&Path>) -> Res
 
 // ── Ratings Music Library does not have yet ─────────────────────────────
 
-/// A rating saved in an MP3 that Music Library's catalog does not show yet.
+/// A rating or Love saved in an MP3 that Music Library's catalog does not
+/// show yet.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PendingRating {
     pub path: PathBuf,
     pub album_id: String,
     /// 0–100, or `None` for a cleared rating.
     pub rating: Option<i64>,
+    /// Missing in lists saved by 0.12.0, which only had ratings.
+    #[serde(default)]
+    pub loved: Option<bool>,
 }
 
 fn pending_path() -> Option<PathBuf> {
@@ -512,13 +623,13 @@ mod tests {
                 });
             });
 
-            write_rating(&path, stars(4)).unwrap();
+            save(&path, Change::Rating(stars(4))).unwrap();
 
             let bytes = fs::read(&path).unwrap();
             let frame = [b"MusicBee\0".as_slice(), &[196, 0, 0, 0, 0]].concat();
             assert!(bytes.windows(frame.len()).any(|window| window == frame));
             assert!(bytes.ends_with(AUDIO));
-            assert_eq!(read_rating_from_path(&path).unwrap(), Some(80));
+            assert_eq!(read_values_from_path(&path).unwrap().rating, Some(80));
             let tag = Tag::read_from_path(&path).unwrap();
             assert!(tag.frames().any(|frame| {
                 frame
@@ -539,9 +650,9 @@ mod tests {
         let path = mp3(dir.path(), Version::Id3v23, |tag| {
             tag.add_frame(popm(LEGACY_DEFAULT_OWNER, 153, 0));
         });
-        assert_eq!(read_rating_from_path(&path).unwrap(), Some(60));
+        assert_eq!(read_values_from_path(&path).unwrap().rating, Some(60));
 
-        write_rating(&path, stars(5)).unwrap();
+        save(&path, Change::Rating(stars(5))).unwrap();
         let tag = Tag::read_from_path(&path).unwrap();
         let owners: Vec<_> = tag
             .frames()
@@ -550,8 +661,8 @@ mod tests {
             .collect();
         assert_eq!(owners, [(MUSICBEE_OWNER.to_owned(), 255)]);
 
-        write_rating(&path, None).unwrap();
-        assert_eq!(read_rating_from_path(&path).unwrap(), None);
+        save(&path, Change::Rating(None)).unwrap();
+        assert_eq!(read_values_from_path(&path).unwrap().rating, None);
         let tag = Tag::read_from_path(&path).unwrap();
         assert_eq!(tag.frames().filter(|frame| frame.id() == "POPM").count(), 0);
         assert!(fs::read(&path).unwrap().ends_with(AUDIO));
@@ -562,8 +673,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bare.mp3");
         fs::write(&path, AUDIO).unwrap();
-        write_rating(&path, stars(1)).unwrap();
-        assert_eq!(read_rating_from_path(&path).unwrap(), Some(20));
+        save(&path, Change::Rating(stars(1))).unwrap();
+        assert_eq!(read_values_from_path(&path).unwrap().rating, Some(20));
         assert!(fs::read(&path).unwrap().ends_with(AUDIO));
     }
 
@@ -573,9 +684,9 @@ mod tests {
         let path = mp3(dir.path(), Version::Id3v23, |tag| {
             tag.add_frame(popm(MUSICBEE_OWNER, 186, 0));
         });
-        assert_eq!(read_rating_from_path(&path).unwrap(), Some(70));
-        write_rating(&path, stars(3)).unwrap();
-        assert_eq!(read_rating_from_path(&path).unwrap(), Some(60));
+        assert_eq!(read_values_from_path(&path).unwrap().rating, Some(70));
+        save(&path, Change::Rating(stars(3))).unwrap();
+        assert_eq!(read_values_from_path(&path).unwrap().rating, Some(60));
     }
 
     #[test]
@@ -585,11 +696,107 @@ mod tests {
             tag.add_frame(popm(MUSICBEE_OWNER, 99, 0));
         });
         let before = fs::read(&path).unwrap();
-        assert!(write_rating(&path, stars(2)).is_err());
+        assert!(save(&path, Change::Rating(stars(2))).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
 
         let flac = dir.path().join("track.flac");
         fs::write(&flac, AUDIO).unwrap();
-        assert!(write_rating(&flac, stars(2)).is_err());
+        assert!(save(&flac, Change::Rating(stars(2))).is_err());
+    }
+
+    fn love_texts(path: &Path) -> Vec<(String, String)> {
+        Tag::read_from_path(path)
+            .unwrap()
+            .extended_texts()
+            .map(|text| (text.description.clone(), text.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn toggles_love_like_musicbee_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mp3(dir.path(), Version::Id3v24, |tag| {
+            tag.add_frame(popm(MUSICBEE_OWNER, 196, 0));
+            tag.add_frame(ExtendedText {
+                description: "Other".to_owned(),
+                value: "keep me".to_owned(),
+            });
+        });
+
+        let loved = save(&path, Change::ToggleLove).unwrap();
+        assert_eq!(
+            loved,
+            Values {
+                rating: Some(80),
+                love: Love::Loved
+            }
+        );
+        let mut texts = love_texts(&path);
+        texts.sort();
+        assert_eq!(
+            texts,
+            [
+                ("LOVE RATING".to_owned(), "L".to_owned()),
+                ("Other".to_owned(), "keep me".to_owned())
+            ]
+        );
+        assert!(fs::read(&path).unwrap().ends_with(AUDIO));
+
+        // A second press reads the saved value and takes Love away again.
+        assert_eq!(save(&path, Change::ToggleLove).unwrap().love, Love::Neutral);
+        assert_eq!(
+            love_texts(&path),
+            [("Other".to_owned(), "keep me".to_owned())]
+        );
+        assert_eq!(read_values_from_path(&path).unwrap().rating, Some(80));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn banned_becomes_loved_and_a_rating_keeps_love() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mp3(dir.path(), Version::Id3v23, |tag| {
+            tag.add_frame(ExtendedText {
+                description: "love rating".to_owned(),
+                value: "B".to_owned(),
+            });
+        });
+        assert_eq!(read_values_from_path(&path).unwrap().love, Love::Banned);
+        assert_eq!(save(&path, Change::ToggleLove).unwrap().love, Love::Loved);
+        assert_eq!(
+            love_texts(&path),
+            [("LOVE RATING".to_owned(), "L".to_owned())]
+        );
+
+        let rated = save(&path, Change::Rating(stars(5))).unwrap();
+        assert_eq!(
+            rated,
+            Values {
+                rating: Some(100),
+                love: Love::Loved
+            }
+        );
+    }
+
+    #[test]
+    fn leaves_unknown_love_values_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mp3(dir.path(), Version::Id3v23, |tag| {
+            tag.add_frame(ExtendedText {
+                description: LOVE_DESCRIPTION.to_owned(),
+                value: "maybe".to_owned(),
+            });
+        });
+        let before = fs::read(&path).unwrap();
+        assert!(save(&path, Change::ToggleLove).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn reads_pending_lists_from_before_love() {
+        let old = r#"[{"path":"D:\\a.mp3","album_id":"7","rating":60}]"#;
+        let pending: Vec<PendingRating> = serde_json::from_str(old).unwrap();
+        assert_eq!(pending[0].rating, Some(60));
+        assert_eq!(pending[0].loved, None);
     }
 }

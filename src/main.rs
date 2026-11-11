@@ -11,6 +11,7 @@ mod music_library;
 mod rating;
 mod search;
 mod settings;
+mod shortcuts;
 mod text_input;
 mod update;
 
