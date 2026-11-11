@@ -1,19 +1,25 @@
-//! The main window: Artists → Albums → Tracks, with a now-playing bar.
+//! The main window: Artists → Albums → Tracks, or a wall of album covers,
+//! with a now-playing bar.
 
 use crate::{
     audio::Audio,
+    covers::{self, CoverIndex},
     library::{Artist, Catalog, Track, catalog_path},
     update::{self, Release},
 };
 use gpui::{
-    Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, ScrollStrategy, SharedString, Stateful, Task, UniformListScrollHandle, Window, canvas,
-    div, prelude::*, px, relative, rgb, svg, uniform_list,
+    Bounds, ClickEvent, Context, Div, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
+    MouseDownEvent, ObjectFit, Pixels, RenderImage, ScrollStrategy, SharedString, Stateful, Task,
+    UniformListScrollHandle, Window, canvas, div, img, prelude::*, px, relative, rgb, svg,
+    uniform_list,
 };
 use std::{
     cell::Cell,
+    collections::HashMap,
     ops::Range,
+    path::PathBuf,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,6 +27,14 @@ const ROW_HEIGHT: Pixels = px(30.);
 const TICK: Duration = Duration::from_millis(250);
 /// Keystrokes this close together build one search, like "pink f".
 const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Cover wall tiles: the square cover, then two lines of text.
+const TILE: Pixels = px(180.);
+const TILE_GAP: Pixels = px(18.);
+/// Top padding, cover, and room for the title and artist lines.
+const TILE_ROW_HEIGHT: Pixels = px(18. + 180. + 52.);
+/// Thumbnails kept in memory; older ones are dropped and reloaded when needed.
+const COVERS_IN_MEMORY: usize = 300;
 
 mod color {
     pub const BACKGROUND: u32 = 0x0e1016;
@@ -51,12 +65,49 @@ enum LoadState {
     Failed(String),
 }
 
+struct Loaded {
+    catalog: Catalog,
+    artists: Vec<Artist>,
+    covers: Result<usize, String>,
+}
+
+/// A cover on the wall. The numbers are the wall frame it was last on screen,
+/// so jobs and thumbnails that scrolled away can be cancelled or dropped.
+enum Cover {
+    /// Dropping the task cancels the job if it has not started.
+    Loading {
+        _task: Task<()>,
+        wanted: u64,
+    },
+    Ready {
+        image: Arc<RenderImage>,
+        used: u64,
+    },
+    Missing,
+}
+
 pub struct AuroraApp {
     focus_handle: FocusHandle,
     load_state: LoadState,
     catalog: Option<Catalog>,
     artists: Vec<Artist>,
     album_count: usize,
+
+    /// Where each artist's albums start in the cover wall, which lists every
+    /// album in artist order.
+    album_offsets: Vec<usize>,
+    /// How many albums have a cover, or why none do.
+    covers_found: Result<usize, String>,
+
+    cover_wall: bool,
+    wall_scroll: UniformListScrollHandle,
+    wall_columns: usize,
+    /// Counts renders, to tell which covers are still on screen.
+    wall_frame: u64,
+    covers: HashMap<usize, Cover>,
+    thumbnail_dir: Option<PathBuf>,
+    /// Thumbnails dropped from memory, to be removed from the GPU on the next render.
+    stale_images: Vec<Arc<RenderImage>>,
 
     selected_artist: Option<usize>,
     selected_album: Option<usize>,
@@ -92,8 +143,23 @@ impl AuroraApp {
         // Reading 74k albums takes a moment, so it happens off the UI thread.
         let loading = cx.background_executor().spawn(async move {
             let catalog = Catalog::open(&catalog_path()?)?;
-            let artists = catalog.artists()?;
-            Ok::<_, String>((catalog, artists))
+            let mut artists = catalog.artists()?;
+            let covers = CoverIndex::scan(&covers::covers_dir()).map(|index| {
+                let mut found = 0;
+                for album in artists.iter_mut().flat_map(|artist| &mut artist.albums) {
+                    album.cover = album
+                        .folder
+                        .as_deref()
+                        .and_then(|folder| index.find(folder));
+                    found += usize::from(album.cover.is_some());
+                }
+                found
+            });
+            Ok::<_, String>(Loaded {
+                catalog,
+                artists,
+                covers,
+            })
         });
         cx.spawn(async move |this, cx| {
             let result = loading.await;
@@ -129,6 +195,15 @@ impl AuroraApp {
             catalog: None,
             artists: Vec::new(),
             album_count: 0,
+            album_offsets: Vec::new(),
+            covers_found: Ok(0),
+            cover_wall: false,
+            wall_scroll: UniformListScrollHandle::new(),
+            wall_columns: 1,
+            wall_frame: 0,
+            covers: HashMap::new(),
+            thumbnail_dir: covers::thumbnail_dir(),
+            stale_images: Vec::new(),
             selected_artist: None,
             selected_album: None,
             selected_track: None,
@@ -151,14 +226,23 @@ impl AuroraApp {
         }
     }
 
-    fn finish_loading(
-        &mut self,
-        result: Result<(Catalog, Vec<Artist>), String>,
-        cx: &mut Context<Self>,
-    ) {
+    fn finish_loading(&mut self, result: Result<Loaded, String>, cx: &mut Context<Self>) {
         match result {
-            Ok((catalog, artists)) => {
+            Ok(Loaded {
+                catalog,
+                artists,
+                covers,
+            }) => {
+                self.album_offsets = artists
+                    .iter()
+                    .scan(0, |offset, artist| {
+                        let start = *offset;
+                        *offset += artist.albums.len();
+                        Some(start)
+                    })
+                    .collect();
                 self.album_count = artists.iter().map(|artist| artist.albums.len()).sum();
+                self.covers_found = covers;
                 self.catalog = Some(catalog);
                 self.artists = artists;
                 self.load_state = LoadState::Ready;
@@ -220,7 +304,133 @@ impl AuroraApp {
         {
             self.select_artist(ix, cx);
             self.artist_scroll.scroll_to_item(ix, ScrollStrategy::Top);
+            if self.cover_wall {
+                let row = self.album_offsets[ix] / self.wall_columns;
+                self.wall_scroll.scroll_to_item(row, ScrollStrategy::Top);
+            }
         }
+    }
+
+    // ── Cover wall ──────────────────────────────────────────────────────
+
+    fn toggle_cover_wall(&mut self, cx: &mut Context<Self>) {
+        self.cover_wall = !self.cover_wall;
+        // Keep the selected album in view when switching.
+        if let (Some(artist), Some(album)) = (self.selected_artist, self.selected_album) {
+            if self.cover_wall {
+                let row = (self.album_offsets[artist] + album) / self.wall_columns;
+                self.wall_scroll.scroll_to_item(row, ScrollStrategy::Center);
+            } else {
+                self.artist_scroll
+                    .scroll_to_item(artist, ScrollStrategy::Center);
+                self.album_scroll
+                    .scroll_to_item(album, ScrollStrategy::Center);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The artist and album at position `ix` on the wall.
+    fn wall_album(&self, ix: usize) -> (usize, usize) {
+        let artist = self.album_offsets.partition_point(|&start| start <= ix) - 1;
+        (artist, ix - self.album_offsets[artist])
+    }
+
+    fn select_wall_album(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let (artist, album) = self.wall_album(ix);
+        if self.selected_artist != Some(artist) || self.selected_album != Some(album) {
+            self.selected_artist = Some(artist);
+            self.select_album(album, cx);
+        }
+    }
+
+    /// The thumbnail for wall position `ix`: `None` while it loads,
+    /// `Some(None)` when the album has no cover. Starts a job if needed.
+    fn cover(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<Option<Arc<RenderImage>>> {
+        let frame = self.wall_frame;
+        match self.covers.get_mut(&ix) {
+            Some(Cover::Ready { image, used }) => {
+                *used = frame;
+                return Some(Some(image.clone()));
+            }
+            Some(Cover::Loading { wanted, .. }) => {
+                *wanted = frame;
+                return None;
+            }
+            Some(Cover::Missing) => return Some(None),
+            None => {}
+        }
+        let (artist, album) = self.wall_album(ix);
+        let Some(path) = self.artists[artist].albums[album].cover.clone() else {
+            self.covers.insert(ix, Cover::Missing);
+            return Some(None);
+        };
+        let cache = self.thumbnail_dir.clone();
+        let job = cx
+            .background_executor()
+            .spawn(async move { covers::thumbnail(&path, cache.as_deref()) });
+        let task = cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| this.finish_cover(ix, result, cx))
+                .ok();
+        });
+        self.covers.insert(
+            ix,
+            Cover::Loading {
+                _task: task,
+                wanted: frame,
+            },
+        );
+        None
+    }
+
+    fn finish_cover(
+        &mut self,
+        ix: usize,
+        result: Result<Arc<RenderImage>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let cover = match result {
+            Ok(image) => Cover::Ready {
+                image,
+                used: self.wall_frame,
+            },
+            Err(_) => Cover::Missing,
+        };
+        self.covers.insert(ix, cover);
+
+        // Over the limit: drop the covers that have been off screen longest,
+        // plus some headroom so this does not run for every new cover.
+        let mut ready: Vec<(u64, usize)> = self
+            .covers
+            .iter()
+            .filter_map(|(&ix, cover)| match cover {
+                Cover::Ready { used, .. } => Some((*used, ix)),
+                _ => None,
+            })
+            .collect();
+        if ready.len() > COVERS_IN_MEMORY {
+            ready.sort_unstable();
+            let excess = ready.len() - COVERS_IN_MEMORY + COVERS_IN_MEMORY / 4;
+            for (_, ix) in ready.into_iter().take(excess) {
+                if let Some(Cover::Ready { image, .. }) = self.covers.remove(&ix) {
+                    self.stale_images.push(image);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cancels jobs for covers that were not on screen in the last frame, and
+    /// frees the GPU copies of dropped thumbnails.
+    fn tidy_covers(&mut self, window: &mut Window) {
+        let frame = self.wall_frame;
+        self.covers
+            .retain(|_, cover| !matches!(cover, Cover::Loading { wanted, .. } if *wanted < frame));
+        for image in self.stale_images.drain(..) {
+            window.drop_image(image).ok();
+        }
+        self.wall_frame += 1;
     }
 
     // ── Updates ─────────────────────────────────────────────────────────
@@ -448,11 +658,19 @@ impl AuroraApp {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = match &self.load_state {
             LoadState::Loading => "Loading library…".into(),
-            LoadState::Ready => format!(
-                "{} artists · {} albums",
-                thousands(self.artists.len()),
-                thousands(self.album_count)
-            )
+            LoadState::Ready => match &self.covers_found {
+                Ok(covers) => format!(
+                    "{} artists · {} albums · {} covers",
+                    thousands(self.artists.len()),
+                    thousands(self.album_count),
+                    thousands(*covers)
+                ),
+                Err(_) => format!(
+                    "{} artists · {} albums",
+                    thousands(self.artists.len()),
+                    thousands(self.album_count)
+                ),
+            }
             .into(),
             LoadState::Failed(_) => "Library unavailable".into(),
         };
@@ -483,6 +701,15 @@ impl AuroraApp {
                     .items_center()
                     .gap_4()
                     .child(div().text_sm().text_color(rgb(color::MUTED)).child(status))
+                    .when(matches!(self.load_state, LoadState::Ready), |row| {
+                        row.child(
+                            text_button("cover-wall", "Cover wall", self.cover_wall).on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.toggle_cover_wall(cx)
+                                }),
+                            ),
+                        )
+                    })
                     .child(self.render_update(cx)),
             )
     }
@@ -607,6 +834,151 @@ impl AuroraApp {
             Some(error) => panel.child(message(error.clone(), color::ERROR)),
             None => panel.child(list),
         }
+    }
+
+    fn render_wall(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = window.viewport_size().width;
+        let columns = (((width - TILE_GAP) / (TILE + TILE_GAP)).floor() as usize).max(1);
+        if columns != self.wall_columns {
+            // Keep the same albums in view when the window is resized.
+            let scrolled = -self.wall_scroll.0.borrow().base_handle.offset().y;
+            let top_row = (scrolled / TILE_ROW_HEIGHT).max(0.) as usize;
+            let first = top_row * self.wall_columns;
+            self.wall_scroll
+                .scroll_to_item(first / columns, ScrollStrategy::Top);
+            self.wall_columns = columns;
+        }
+        // Centre the grid; the last row stays left-aligned.
+        let used = TILE * columns as f32 + TILE_GAP * (columns as f32 - 1.);
+        let inset = ((width - used) / 2.).max(TILE_GAP / 2.);
+        let rows = self.album_count.div_ceil(columns);
+
+        let wall = uniform_list(
+            "cover-wall",
+            rows,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                let columns = this.wall_columns;
+                range
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(this.album_count);
+                        let tiles: Vec<_> =
+                            (start..end).map(|ix| this.render_tile(ix, cx)).collect();
+                        div()
+                            .h(TILE_ROW_HEIGHT)
+                            .pt(TILE_GAP)
+                            .pl(inset)
+                            .flex()
+                            .gap(TILE_GAP)
+                            .children(tiles)
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(self.wall_scroll.clone())
+        .size_full();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .when_some(self.covers_found.as_ref().err(), |wall, error| {
+                wall.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(color::ERROR))
+                        .border_b_1()
+                        .border_color(rgb(color::BORDER))
+                        .child(format!(
+                            "{error} Set AURORA_NG_COVERS to the folder with your album covers."
+                        )),
+                )
+            })
+            .child(div().flex_1().min_h_0().child(wall))
+    }
+
+    fn render_tile(&mut self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let cover = self.cover(ix, cx);
+        let (artist_ix, album_ix) = self.wall_album(ix);
+        let selected =
+            self.selected_artist == Some(artist_ix) && self.selected_album == Some(album_ix);
+        let artist = &self.artists[artist_ix];
+        let album = &artist.albums[album_ix];
+        let subtitle = match album.year {
+            Some(year) => format!("{} · {year}", artist.name),
+            None => artist.name.clone(),
+        };
+
+        let artwork = div()
+            .size(TILE)
+            .flex_none()
+            .rounded_md()
+            .overflow_hidden()
+            .bg(rgb(color::PANEL))
+            .border_2()
+            .border_color(rgb(if selected {
+                color::ACCENT
+            } else {
+                color::BACKGROUND
+            }))
+            .when(!selected, |artwork| {
+                artwork.group_hover("tile", |style| style.border_color(rgb(color::MUTED)))
+            });
+        let artwork = match cover {
+            Some(Some(image)) => artwork.child(
+                img(ImageSource::Render(image))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            ),
+            // No cover: show the title instead.
+            Some(None) => artwork.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .text_center()
+                    .text_color(rgb(color::MUTED))
+                    .child(album.title.clone()),
+            ),
+            None => artwork,
+        };
+
+        div()
+            .id(("cover", ix))
+            .group("tile")
+            .w(TILE)
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .cursor_pointer()
+            .child(artwork)
+            .child(
+                div()
+                    .flex_none()
+                    .mt_1()
+                    .truncate()
+                    .when(selected, |title| title.text_color(rgb(color::ACCENT)))
+                    .child(album.title.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(color::MUTED))
+                    .child(subtitle),
+            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                this.select_wall_album(ix, cx);
+                if event.click_count() >= 2 {
+                    this.play_from(0, cx);
+                }
+            }))
     }
 
     fn render_now_playing(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -749,10 +1121,14 @@ impl AuroraApp {
 }
 
 impl Render for AuroraApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tidy_covers(window);
         let body = match &self.load_state {
             LoadState::Loading => message("Loading your library…".to_owned(), color::MUTED),
             LoadState::Failed(error) => message(error.clone(), color::ERROR),
+            LoadState::Ready if self.cover_wall => {
+                div().size_full().child(self.render_wall(window, cx))
+            }
             LoadState::Ready => div()
                 .flex()
                 .size_full()

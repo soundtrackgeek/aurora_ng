@@ -1,6 +1,6 @@
 [package]
 name = "aurora_ng"
-version = "0.2.1"
+version = "0.3.0"
 description = "Aurora rebuilt natively with Rust and GPUI: browse the library and play music"
 authors = ["Jørn Tillnes"]
 edition = "2024"
@@ -9,6 +9,7 @@ rust-version = "1.95"
 [dependencies]
 anyhow = "1"
 gpui = "0.2.2"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp3", "flac", "mp4", "vorbis", "wav"] }
 rusqlite = { version = "0.42.0", features = ["bundled"] }
 self-replace = "1.5.1"

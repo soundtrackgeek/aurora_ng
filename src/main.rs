@@ -3,6 +3,7 @@
 
 mod app;
 mod audio;
+mod covers;
 mod library;
 mod update;
 

@@ -2,6 +2,15 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.3.0] - 2026-11-11
+
+### Added
+
+- Cover wall: a **Cover wall** button in the header shows every album as a grid of covers. Click a cover to select the album, double-click to play it, and type an artist's name to jump to their albums. Switching back to the columns keeps the album selected.
+- Album covers are matched to albums by folder name from `C:\_code\music_backup_v5\AlbumCovers`, or the folder in `AURORA_NG_COVERS`.
+- Covers are shrunk to 320 × 320 thumbnails in the background and saved in `%LOCALAPPDATA%\aurora_ng\thumbnails`. Only covers on screen are loaded, and memory use stays bounded however far you scroll.
+- The header shows how many albums have a cover.
+
 ## [0.2.1] - 2026-11-11
 
 ### Changed

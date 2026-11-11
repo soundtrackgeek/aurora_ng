@@ -11,6 +11,10 @@ pub struct Album {
     pub id: String,
     pub title: String,
     pub year: Option<i64>,
+    /// The folder the album's files are in, like `D:\MUSIC\Kittie - Oracle (2001)`.
+    pub folder: Option<String>,
+    /// Filled in from the covers folder after loading.
+    pub cover: Option<PathBuf>,
 }
 
 pub struct Artist {
@@ -82,7 +86,9 @@ impl Catalog {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, album, album_artist_display, COALESCE(year, release_year) FROM albums",
+                "SELECT a.id, a.album, a.album_artist_display, COALESCE(a.year, a.release_year),
+                        (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1)
+                 FROM albums a",
             )
             .map_err(|error| format!("Could not read albums: {error}"))?;
         let rows = statement
@@ -92,13 +98,14 @@ impl Catalog {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
 
         let mut artists: BTreeMap<String, Artist> = BTreeMap::new();
         for row in rows {
-            let (id, title, artist, year) =
+            let (id, title, artist, year, folder) =
                 row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
@@ -114,6 +121,8 @@ impl Catalog {
                     id,
                     title: non_empty(title).unwrap_or_else(|| "Unknown Album".to_owned()),
                     year,
+                    folder: non_empty(folder),
+                    cover: None,
                 });
         }
 
