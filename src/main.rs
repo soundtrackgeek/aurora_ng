@@ -15,6 +15,7 @@ mod settings;
 mod shortcuts;
 mod text_input;
 mod update;
+mod waveform;
 
 use gpui::{
     App, Application, AssetSource, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds,

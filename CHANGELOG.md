@@ -2,6 +2,16 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.16.0] - 2026-11-12
+
+### Added
+
+- The seek bar shows the playing track's waveform, as in Aurora, so you can see the quiet and the loud parts. It is read from the audio file in the background when the track starts (a few tenths of a second), drawn bright up to where playback is and dim after, with a line at the current position. Until it is ready, or for a file that cannot be read, the plain bar is shown.
+
+### Changed
+
+- The now-playing bar is a little taller, to fit the waveform, and the seek bar moves smoothly instead of a second at a time.
+
 ## [0.15.0] - 2026-11-11
 
 ### Added

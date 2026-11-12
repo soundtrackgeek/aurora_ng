@@ -13,13 +13,14 @@ use crate::{
     shortcuts,
     text_input::{InputEvent, TextInput},
     update::{self, Release},
+    waveform::Waveform,
 };
 use gpui::{
     Bounds, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, ImageSource, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, Pixels, RenderImage, Resource, ScrollStrategy, SharedString, Stateful,
-    Subscription, Task, UniformListScrollHandle, Window, WindowBounds, actions, canvas, div, img,
-    list, prelude::*, px, relative, rgb, svg, uniform_list,
+    Subscription, Task, UniformListScrollHandle, Window, WindowBounds, actions, canvas, div, fill,
+    img, list, point, prelude::*, px, relative, rgb, size, svg, uniform_list,
 };
 use rusqlite::InterruptHandle;
 use std::{
@@ -81,6 +82,12 @@ pub(crate) mod color {
     pub const CHART: u32 = 0xc084fc;
     /// Empty stars and hearts.
     pub const UNSET: u32 = 0x3a4052;
+    /// The waveform in the seek bar: played from start to end of the track,
+    /// then what is still to come.
+    pub const WAVE_PLAYED_START: u32 = 0xe879f9;
+    pub const WAVE_PLAYED_END: u32 = 0xc026d3;
+    pub const WAVE_START: u32 = 0x4c2d6e;
+    pub const WAVE_END: u32 = 0x1e5f5a;
 }
 
 /// An item in the cover wall's list: a row of covers, or the details of the
@@ -252,6 +259,10 @@ pub struct AuroraApp {
     current: Option<usize>,
     playback_error: Option<String>,
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The playing track's waveform, drawn in the seek bar once it has
+    /// been read from the file.
+    waveform: Option<(PathBuf, Arc<Waveform>)>,
+    _waveform_task: Option<Task<()>>,
     /// The listening history shared with Aurora and Music Library.
     history: Option<History>,
     /// The listen to the track playing now.
@@ -431,6 +442,8 @@ impl AuroraApp {
             current: None,
             playback_error: None,
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
+            waveform: None,
+            _waveform_task: None,
             history: History::open().ok(),
             session: None,
             track_stats: None,
@@ -1270,6 +1283,7 @@ impl AuroraApp {
                     self.current = Some(offset);
                     self.playback_error = None;
                     self.begin_session(cx);
+                    self.load_waveform(cx);
                     return;
                 }
                 Err(error) => self.playback_error = Some(error),
@@ -1329,6 +1343,38 @@ impl AuroraApp {
         audio.seek(target);
         self.after_seek(position, target);
         cx.notify();
+    }
+
+    /// Reads the playing track's waveform in the background, unless it is
+    /// already there (the same track again).
+    fn load_waveform(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.current_track().map(|track| track.path.clone()) else {
+            return;
+        };
+        if self
+            .waveform
+            .as_ref()
+            .is_some_and(|(shown, _)| *shown == path)
+        {
+            return;
+        }
+        self.waveform = None;
+        let job = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { Waveform::analyze(&path) }
+        });
+        self._waveform_task = Some(cx.spawn(async move |this, cx| {
+            // A file that cannot be read keeps the plain seek bar.
+            if let Ok(waveform) = job.await {
+                this.update(cx, |this, cx| {
+                    if this.current_track().is_some_and(|track| track.path == path) {
+                        this.waveform = Some((path, Arc::new(waveform)));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        }));
     }
 
     fn current_track(&self) -> Option<&Track> {
@@ -2623,10 +2669,11 @@ impl AuroraApp {
             _ => 0,
         };
         let total = track.and_then(|track| track.duration_seconds).unwrap_or(0);
-        let fraction = if total > 0 {
-            (elapsed as f32 / total as f32).clamp(0., 1.)
-        } else {
-            0.
+        let fraction = match (&self.audio, track) {
+            (Ok(audio), Some(_)) if total > 0 => {
+                (audio.position().as_secs_f32() / total as f32).clamp(0., 1.)
+            }
+            _ => 0.,
         };
 
         let title = match (track, &self.playback_error, &self.audio) {
@@ -2659,12 +2706,15 @@ impl AuroraApp {
         };
 
         let bounds_cell = self.seek_bar_bounds.clone();
+        let waveform = self
+            .waveform
+            .as_ref()
+            .filter(|(path, _)| track.is_some_and(|track| track.path == *path))
+            .map(|(_, waveform)| waveform.clone());
         let seek_bar = div()
             .id("seek-bar")
             .flex_1()
-            .h(px(16.))
-            .flex()
-            .items_center()
+            .h(px(WAVEFORM_HEIGHT))
             .when(track.is_some(), |bar| bar.cursor_pointer())
             .on_mouse_down(
                 MouseButton::Left,
@@ -2672,37 +2722,23 @@ impl AuroraApp {
                     this.seek_to(event.position.x, cx);
                 }),
             )
+            // Remembers where the bar is on screen, so a click can be turned
+            // into a position in the track, and paints the waveform there.
             .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .h(px(4.))
-                    .rounded_full()
-                    .bg(rgb(color::BAR))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .h_full()
-                            .w(relative(fraction))
-                            .rounded_full()
-                            .bg(rgb(color::ACCENT)),
-                    )
-                    // Remembers where the bar is on screen, so a click can be
-                    // turned into a position in the track.
-                    .child(
-                        canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {})
-                            .absolute()
-                            .size_full(),
-                    ),
+                canvas(
+                    move |bounds, _, _| bounds_cell.set(bounds),
+                    move |bounds, _, window, _| {
+                        paint_seek_bar(bounds, fraction, waveform.as_deref(), window)
+                    },
+                )
+                .size_full(),
             );
 
         div()
             .flex()
             .items_center()
             .gap_5()
-            .h(px(72.))
+            .h(px(80.))
             .px_4()
             .bg(rgb(color::PANEL))
             .border_t_1()
@@ -3066,6 +3102,87 @@ fn track_title(track: &Track) -> Div {
                     .text_color(rgb(color::TEXT)),
             )
         })
+}
+
+/// How tall the waveform in the seek bar is.
+const WAVEFORM_HEIGHT: f32 = 30.;
+
+/// Paints the seek bar: the track's waveform once it has been read, bright up
+/// to where playback is and dim after, or a thin bar until then.
+fn paint_seek_bar(
+    bounds: Bounds<Pixels>,
+    fraction: f32,
+    waveform: Option<&Waveform>,
+    window: &mut Window,
+) {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if width <= 0. {
+        return;
+    }
+    let played_x = width * fraction;
+    let Some(waveform) = waveform.filter(|waveform| !waveform.is_empty()) else {
+        let bar = |w: f32, color: u32| {
+            fill(
+                Bounds::new(
+                    point(bounds.left(), bounds.top() + px((height - 4.) / 2.)),
+                    size(px(w), px(4.)),
+                ),
+                rgb(color),
+            )
+            .corner_radii(px(2.))
+        };
+        window.paint_quad(bar(width, color::BAR));
+        if played_x > 0. {
+            window.paint_quad(bar(played_x, color::ACCENT));
+        }
+        return;
+    };
+
+    const BAR_WIDTH: f32 = 2.;
+    const STEP: f32 = 3.;
+    let count = (width / STEP).floor() as usize;
+    for (ix, level) in waveform.bars(count).into_iter().enumerate() {
+        let x = ix as f32 * STEP;
+        // Mirrored around the middle, never thinner than a hairline so
+        // silence still shows where the track is.
+        let bar_height = (level * height).max(1.);
+        let along = x / width;
+        let color = if x + BAR_WIDTH / 2. <= played_x {
+            mix(color::WAVE_PLAYED_START, color::WAVE_PLAYED_END, along)
+        } else {
+            mix(color::WAVE_START, color::WAVE_END, along)
+        };
+        window.paint_quad(fill(
+            Bounds::new(
+                point(
+                    bounds.left() + px(x),
+                    bounds.top() + px((height - bar_height) / 2.),
+                ),
+                size(px(BAR_WIDTH), px(bar_height)),
+            ),
+            rgb(color),
+        ));
+    }
+    if fraction > 0. {
+        window.paint_quad(fill(
+            Bounds::new(
+                point(bounds.left() + px(played_x.min(width - 1.)), bounds.top()),
+                size(px(1.), px(height)),
+            ),
+            rgb(color::TEXT),
+        ));
+    }
+}
+
+/// The color `amount` of the way from `from` to `to`.
+fn mix(from: u32, to: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0., 1.);
+    [16, 8, 0].into_iter().fold(0, |color, shift| {
+        let a = ((from >> shift) & 0xff) as f32;
+        let b = ((to >> shift) & 0xff) as f32;
+        color | (((a + (b - a) * amount).round() as u32) << shift)
+    })
 }
 
 /// An album's chart peaks, each a flag and its position: "🇺🇸 #1 🇬🇧 #1 🇳🇴 #3".
