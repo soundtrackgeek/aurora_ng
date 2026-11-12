@@ -9,6 +9,7 @@ mod id3_write;
 mod install;
 mod library;
 mod music_library;
+mod popularity;
 mod rating;
 mod search;
 mod settings;
@@ -35,6 +36,7 @@ impl AssetSource for Assets {
             "icons/previous.svg" => include_bytes!("../assets/icons/previous.svg"),
             "icons/next.svg" => include_bytes!("../assets/icons/next.svg"),
             "icons/star.svg" => include_bytes!("../assets/icons/star.svg"),
+            "icons/flame.svg" => include_bytes!("../assets/icons/flame.svg"),
             "icons/heart.svg" => include_bytes!("../assets/icons/heart.svg"),
             "icons/heart-outline.svg" => include_bytes!("../assets/icons/heart-outline.svg"),
             "icons/disc.svg" => include_bytes!("../assets/icons/disc.svg"),

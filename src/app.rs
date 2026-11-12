@@ -6,7 +6,7 @@ use crate::{
     covers::{self, CoverIndex},
     history::{History, Outcome, Session, Stats, TrackInfo},
     library::{Album, Artist, Catalog, Track, catalog_path},
-    music_library,
+    music_library, popularity,
     rating::{self, Change, Love, PendingRating, Stars, Values},
     search,
     settings::{self, SavedWindow, Settings},
@@ -80,6 +80,8 @@ pub(crate) mod color {
     pub const LOVE: u32 = 0xf472b6;
     /// Chart labels, like "BB" and "UK" after a track's title.
     pub const CHART: u32 = 0xc084fc;
+    /// The flame on an album's most-listened tracks on Last.fm.
+    pub const FLAME: u32 = 0xfb923c;
     /// Empty stars and hearts.
     pub const UNSET: u32 = 0x3a4052;
     /// The waveform in the seek bar: played from start to end of the track,
@@ -246,6 +248,10 @@ pub struct AuroraApp {
     selected_track: Option<usize>,
     tracks: Vec<Track>,
     tracks_error: Option<String>,
+    /// Where the Last.fm counts behind the 🔥 tracks are read and saved.
+    popularity: popularity::Sources,
+    /// Ranks the open album's tracks, then asks Last.fm about the rest.
+    _popularity_task: Option<Task<()>>,
     artist_scroll: UniformListScrollHandle,
     album_scroll: UniformListScrollHandle,
     track_scroll: UniformListScrollHandle,
@@ -431,6 +437,8 @@ impl AuroraApp {
             selected_album: None,
             selected_track: None,
             tracks: Vec::new(),
+            popularity: popularity::Sources::new(catalog_path().ok()),
+            _popularity_task: None,
             tracks_error: None,
             artist_scroll: UniformListScrollHandle::new(),
             album_scroll: UniformListScrollHandle::new(),
@@ -879,8 +887,73 @@ impl AuroraApp {
             Ok(mut tracks) => {
                 self.apply_known_values(&mut tracks);
                 self.tracks = tracks;
+                let album_artist = self.artists[artist].name.clone();
+                self.load_popularity(album_artist, album.id.clone(), cx);
             }
             Err(error) => self.tracks_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Puts a flame on the open album's three most-listened tracks: first
+    /// from the counts already saved, then, when some are missing or old,
+    /// from Last.fm in the background.
+    fn load_popularity(&mut self, album_artist: String, album_id: String, cx: &mut Context<Self>) {
+        let generation = popularity::next_generation();
+        let lookups: Vec<popularity::Lookup> = self
+            .tracks
+            .iter()
+            .map(|track| popularity::Lookup {
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+            })
+            .collect();
+        let paths: Vec<PathBuf> = self.tracks.iter().map(|track| track.path.clone()).collect();
+        let sources = self.popularity.clone();
+        let saved = cx.background_executor().spawn(async move {
+            let ranks = sources.cached_ranks(&album_artist, &lookups);
+            let stale = sources.needs_refresh(&album_artist, &lookups);
+            (ranks, stale.then_some((sources, album_artist, lookups)))
+        });
+        self._popularity_task = Some(cx.spawn(async move |this, cx| {
+            let (ranks, refresh) = saved.await;
+            this.update(cx, |this, cx| {
+                this.show_popularity(&album_id, &paths, &ranks, cx)
+            })
+            .ok();
+            let Some((sources, album_artist, lookups)) = refresh else {
+                return;
+            };
+            let asked = cx
+                .background_executor()
+                .spawn(async move { sources.refresh(&album_artist, &lookups, generation) });
+            // Offline, or no key: the saved flames stay.
+            if let Ok(ranks) = asked.await {
+                this.update(cx, |this, cx| {
+                    this.show_popularity(&album_id, &paths, &ranks, cx)
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// Sets the flames on the album's tracks, in the list and in the queue.
+    fn show_popularity(
+        &mut self,
+        album_id: &str,
+        paths: &[PathBuf],
+        ranks: &[Option<u8>],
+        cx: &mut Context<Self>,
+    ) {
+        for track in self
+            .tracks
+            .iter_mut()
+            .chain(self.queue.iter_mut())
+            .filter(|track| track.album_id == album_id)
+        {
+            if let Some(ix) = paths.iter().position(|path| *path == track.path) {
+                track.popular = ranks.get(ix).copied().flatten();
+            }
         }
         cx.notify();
     }
@@ -3067,8 +3140,9 @@ fn star_halves(rating: Option<i64>) -> i64 {
     rating.map_or(0, |rating| (rating.clamp(0, 100) + 5) / 10)
 }
 
-/// A track's title, then its chart peaks ("BB #2  UK #1") and a disc when it
-/// was released as a single. The title gives way first when space runs out.
+/// A track's title, then its chart peaks ("BB #2  UK #1"), a flame when it is
+/// one of the album's three most listened on Last.fm, and a disc when it was
+/// released as a single. The title gives way first when space runs out.
 fn track_title(track: &Track) -> Div {
     div()
         .flex()
@@ -3093,6 +3167,15 @@ fn track_title(track: &Track) -> Div {
                         .child(format!("#{}", peak.rank)),
                 )
         }))
+        .when(track.popular.is_some(), |title| {
+            title.child(
+                svg()
+                    .path("icons/flame.svg")
+                    .flex_none()
+                    .size(px(13.))
+                    .text_color(rgb(color::FLAME)),
+            )
+        })
         .when(track.single, |title| {
             title.child(
                 svg()

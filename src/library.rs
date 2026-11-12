@@ -119,6 +119,9 @@ pub struct Track {
     pub charts: Vec<ChartPeak>,
     /// Released as an official single, as MusicBrainz confirms it.
     pub single: bool,
+    /// 1, 2 or 3 for the album's most-listened tracks on Last.fm, shown
+    /// with a flame. Filled in after loading.
+    pub popular: Option<u8>,
 }
 
 impl Track {
@@ -339,6 +342,7 @@ impl Catalog {
                         ],
                     ),
                     single: row.get(15)?,
+                    popular: None,
                 })
             })
             .map_err(|error| format!("Could not read tracks: {error}"))?

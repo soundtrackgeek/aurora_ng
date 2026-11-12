@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.17.0] - 2026-11-12
+
+### Added
+
+- A flame after the title of each album's three most-listened tracks on Last.fm, as in Aurora, in the album details and the Tracks column. Tracks are ranked by Last.fm listeners, then plays. Counts are read from Music Library's catalog and Aurora's Last.fm cache first. Missing or week-old ones are looked up in the background (at most five requests a second) with the Last.fm key Aurora or Music Library saved in Windows Credential Manager, or `LAST_FM` from the environment or `.env.local`, and saved in Aurora NG's own cache.
+
 ## [0.16.0] - 2026-11-12
 
 ### Added

@@ -16,7 +16,11 @@ pub const APP_NAME: &str = "Aurora NG";
 
 fn installed_exe() -> Option<PathBuf> {
     let base = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
-    Some(base.join("Programs").join(APP_NAME).join(format!("{APP_NAME}.exe")))
+    Some(
+        base.join("Programs")
+            .join(APP_NAME)
+            .join(format!("{APP_NAME}.exe")),
+    )
 }
 
 fn start_menu_shortcut() -> Option<PathBuf> {
@@ -83,8 +87,8 @@ fn create_shortcut(link: &Path, target: &Path) -> windows::core::Result<()> {
     use windows::{
         Win32::{
             System::Com::{
-                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance,
-                CoInitializeEx, CoUninitialize, IPersistFile,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize, IPersistFile,
             },
             UI::Shell::{IShellLinkW, ShellLink},
         },
@@ -99,9 +103,12 @@ fn create_shortcut(link: &Path, target: &Path) -> windows::core::Result<()> {
             if let Some(dir) = target.parent() {
                 shell_link.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()))?;
             }
-            shell_link.SetDescription(&HSTRING::from("Browse your music library and play music"))?;
+            shell_link
+                .SetDescription(&HSTRING::from("Browse your music library and play music"))?;
             shell_link.SetIconLocation(&HSTRING::from(target.as_os_str()), 0)?;
-            shell_link.cast::<IPersistFile>()?.Save(&HSTRING::from(link.as_os_str()), true)
+            shell_link
+                .cast::<IPersistFile>()?
+                .Save(&HSTRING::from(link.as_os_str()), true)
         })();
         if initialized {
             CoUninitialize();
