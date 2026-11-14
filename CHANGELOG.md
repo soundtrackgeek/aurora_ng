@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.18.0] - 2026-11-14
+
+### Added
+
+- The flag of the artist's country before their name, as in Aurora, under each cover on the cover wall and in the album details header, like "🇬🇧 Chateaux · 1983". The country is the one Music Library looked up on MusicBrainz (`musicbrainz_artist_origin_countries`). Artists without a known country, or from countries with no flag of their own (such as the Soviet Union), show no flag. All 271 flags from flag-icons (MIT) are compiled into the app.
+
 ## [0.17.0] - 2026-11-12
 
 ### Added

@@ -4,6 +4,7 @@
 mod app;
 mod audio;
 mod covers;
+mod flags;
 mod history;
 mod id3_write;
 mod install;
@@ -40,11 +41,14 @@ impl AssetSource for Assets {
             "icons/heart.svg" => include_bytes!("../assets/icons/heart.svg"),
             "icons/heart-outline.svg" => include_bytes!("../assets/icons/heart-outline.svg"),
             "icons/disc.svg" => include_bytes!("../assets/icons/disc.svg"),
-            // In colour, from flag-icons (MIT), for the album charts.
-            "flags/us.svg" => include_bytes!("../assets/flags/us.svg"),
-            "flags/gb.svg" => include_bytes!("../assets/flags/gb.svg"),
-            "flags/no.svg" => include_bytes!("../assets/flags/no.svg"),
-            _ => return Ok(None),
+            _ => match path
+                .strip_prefix("flags/")
+                .and_then(|file| file.strip_suffix(".svg"))
+                .and_then(flags::svg)
+            {
+                Some(svg) => svg,
+                None => return Ok(None),
+            },
         };
         Ok(Some(Cow::Borrowed(bytes)))
     }

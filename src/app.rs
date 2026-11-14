@@ -755,6 +755,7 @@ impl AuroraApp {
                     (!albums.is_empty()).then(|| Artist {
                         name: artist.name.clone(),
                         sort_key: artist.sort_key.clone(),
+                        flag: artist.flag.clone(),
                         albums,
                     })
                 })
@@ -2350,10 +2351,7 @@ impl AuroraApp {
             self.selected_artist == Some(artist_ix) && self.selected_album == Some(album_ix);
         let artist = &self.artists[artist_ix];
         let album = &artist.albums[album_ix];
-        let subtitle = match album.year {
-            Some(year) => format!("{} · {year}", artist.name),
-            None => artist.name.clone(),
-        };
+        let subtitle = artist_line(artist, album);
         let show_info = show_text && self.info_under_cover();
 
         let artwork = div()
@@ -2411,14 +2409,7 @@ impl AuroraApp {
                         .when(selected, |title| title.text_color(rgb(color::ACCENT)))
                         .child(album.title.clone()),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .truncate()
-                        .text_xs()
-                        .text_color(rgb(color::MUTED))
-                        .child(subtitle),
-                )
+                .child(subtitle.flex_none().text_xs())
                 .when(show_info, |tile| {
                     tile.child(
                         div()
@@ -2515,10 +2506,7 @@ impl AuroraApp {
         let artist = &self.artists[artist_ix];
         let album = &artist.albums[album_ix];
 
-        let subtitle = match album.year {
-            Some(year) => format!("{} · {year}", artist.name),
-            None => artist.name.clone(),
-        };
+        let subtitle = artist_line(artist, album);
         let thumbnail = match self.covers.get(&ix) {
             Some(Cover::Ready { image, .. }) => Some(image.clone()),
             Some(Cover::Loading { previous, .. }) => previous.clone(),
@@ -2551,12 +2539,7 @@ impl AuroraApp {
                         .truncate()
                         .child(album.title.clone()),
                 )
-                .child(
-                    div()
-                        .truncate()
-                        .text_color(rgb(color::MUTED))
-                        .child(subtitle),
-                )
+                .child(subtitle)
                 .child(
                     div()
                         .truncate()
@@ -3266,6 +3249,30 @@ fn mix(from: u32, to: u32, amount: f32) -> u32 {
         let b = ((to >> shift) & 0xff) as f32;
         color | (((a + (b - a) * amount).round() as u32) << shift)
     })
+}
+
+/// "🇬🇧 Chateaux · 1983": where the artist is from, their name and the year.
+fn artist_line(artist: &Artist, album: &Album) -> Div {
+    let text = match album.year {
+        Some(year) => format!("{} · {year}", artist.name),
+        None => artist.name.clone(),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .min_w_0()
+        .text_color(rgb(color::MUTED))
+        .when_some(artist.flag.clone(), |line, flag| {
+            line.child(
+                img(ImageSource::Resource(Resource::Embedded(flag.into())))
+                    .w(px(16.))
+                    .h(px(12.))
+                    .flex_none()
+                    .rounded_xs(),
+            )
+        })
+        .child(div().min_w_0().truncate().child(text))
 }
 
 /// An album's chart peaks, each a flag and its position: "🇺🇸 #1 🇬🇧 #1 🇳🇴 #3".

@@ -33,6 +33,7 @@ Version **0.17.0** browses and searches your library, shows a wall of album cove
   | `sort:az` / `sort:za` | Short for `sort:album az` / `sort:album za` |
 
   Without `az` or `za`, `sort:album` and `sort:aartist` sort A–Z. Albums in the same year are ordered by artist, then title; albums with the same title by artist, then year. The shuffled order is remembered, so the app opens with the same draw after a restart.
+- **Country flags**: the flag of the country an artist is from is shown before their name, as in Aurora, under each cover and in the album details header, like "🇬🇧 Chateaux · 1983". The country comes from Music Library's MusicBrainz lookups; artists without one show no flag.
 - **Charts and singles**, as in Aurora, from what Music Library knows (nothing is looked up online):
   - Albums show their best position on the album charts, each with its country's flag: 🇺🇸 Billboard, 🇬🇧 Official UK and 🇳🇴 VG Lista, like "🇺🇸 #1 🇬🇧 #1 🇳🇴 #3" for Thriller. They are under big covers and in the album details header.
   - Tracks show their best position on the singles charts after the title, in the album details and the **Tracks** column: **BB** (Billboard), **UK** (Official UK), **VG** (VG Lista), **TI** (Ti i Skuddet) and **NT** (Norsktoppen), like "Billie Jean BB #2 UK #1 VG #5 TI #3".

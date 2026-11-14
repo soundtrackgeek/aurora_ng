@@ -98,6 +98,9 @@ pub struct Artist {
     pub name: String,
     /// Lowercase name, used for sorting and type-to-find.
     pub sort_key: String,
+    /// The flag of the country MusicBrainz says the artist is from, like
+    /// "flags/gb.svg".
+    pub flag: Option<String>,
     pub albums: Vec<Album>,
 }
 
@@ -152,6 +155,8 @@ pub struct Catalog {
     connection: Connection,
     /// Music Library 0.210.0 and newer list official singles.
     has_singles: bool,
+    /// Music Library looks up where artists are from on MusicBrainz.
+    has_origins: bool,
 }
 
 impl Catalog {
@@ -174,17 +179,21 @@ impl Catalog {
     }
 
     fn with_connection(connection: Connection) -> Result<Self, String> {
-        let has_singles = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                               WHERE type = 'table' AND name = 'track_singles')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Could not read the catalog: {error}"))?;
+        let has_table = |name: &str| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Could not read the catalog: {error}"))
+        };
+        let has_singles = has_table("track_singles")?;
+        let has_origins = has_table("musicbrainz_artist_origin_countries")?;
         Ok(Self {
             connection,
             has_singles,
+            has_origins,
         })
     }
 
@@ -203,16 +212,25 @@ impl Catalog {
 
     /// Every album artist with their albums, sorted by name, then by year.
     pub fn artists(&self) -> Result<Vec<Artist>, String> {
+        let country = if self.has_origins {
+            format!(
+                "(SELECT o.country_code FROM musicbrainz_artist_origin_countries o
+                  WHERE o.local_artist_key = {})",
+                crate::search::artist_key_sql("a.album_artist_display")
+            )
+        } else {
+            "NULL".to_owned()
+        };
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id, a.album, a.album_artist_display, a.year,
                         (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
                         a.publisher, a.total_tracks, a.total_seconds,
                         a.effective_album_rating, a.album_score, a.canonical_genre,
-                        a.billboard_rank, a.official_uk_rank, a.vg_lista_rank
-                 FROM albums a",
-            )
+                        a.billboard_rank, a.official_uk_rank, a.vg_lista_rank, {country}
+                 FROM albums a"
+            ))
             .map_err(|error| format!("Could not read albums: {error}"))?;
         let rows = statement
             .query_map([], |row| {
@@ -229,6 +247,7 @@ impl Catalog {
                     row.get::<_, Option<f64>>(9)?,
                     row.get::<_, Option<String>>(10)?,
                     chart_peaks(&Chart::ALBUMS, &[row.get(11)?, row.get(12)?, row.get(13)?]),
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -248,31 +267,33 @@ impl Catalog {
                 score,
                 genre,
                 charts,
+                country,
             ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
-            artists
-                .entry(sort_key.clone())
-                .or_insert_with(|| Artist {
-                    name,
-                    sort_key,
-                    albums: Vec::new(),
-                })
-                .albums
-                .push(Album {
-                    id,
-                    title: non_empty(title).unwrap_or_else(|| "Unknown Album".to_owned()),
-                    year,
-                    publisher: non_empty(publisher),
-                    genre: non_empty(genre),
-                    total_tracks,
-                    total_seconds,
-                    rating,
-                    score,
-                    folder: non_empty(folder),
-                    cover: None,
-                    charts,
-                });
+            let artist = artists.entry(sort_key.clone()).or_insert_with(|| Artist {
+                name,
+                sort_key,
+                flag: None,
+                albums: Vec::new(),
+            });
+            if artist.flag.is_none() {
+                artist.flag = country.as_deref().and_then(crate::flags::path);
+            }
+            artist.albums.push(Album {
+                id,
+                title: non_empty(title).unwrap_or_else(|| "Unknown Album".to_owned()),
+                year,
+                publisher: non_empty(publisher),
+                genre: non_empty(genre),
+                total_tracks,
+                total_seconds,
+                rating,
+                score,
+                folder: non_empty(folder),
+                cover: None,
+                charts,
+            });
         }
 
         let mut artists: Vec<Artist> = artists.into_values().collect();
@@ -414,6 +435,7 @@ mod tests {
 
     fn catalog(singles: bool) -> Catalog {
         let connection = Connection::open_in_memory().unwrap();
+        register_functions(&connection).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         if singles {
             connection
@@ -483,6 +505,43 @@ mod tests {
                 ),
                 // Keys are trimmed, as Music Library trims them.
                 ("Human Nature", vec![("BB", 118)], true),
+            ]
+        );
+    }
+
+    #[test]
+    fn artists_carry_the_flag_of_their_country() {
+        let catalog = catalog(true);
+        // Without the origins table, older catalogs load without flags.
+        assert_eq!(catalog.artists().unwrap()[0].flag, None);
+
+        catalog
+            .connection
+            .execute_batch(
+                "CREATE TABLE musicbrainz_artist_origin_countries (local_artist_key TEXT
+                    PRIMARY KEY, country_code TEXT);
+                 INSERT INTO musicbrainz_artist_origin_countries
+                    VALUES ('michael jackson', 'US'), ('kino', 'SU');
+                 INSERT INTO albums (id, album, album_artist_display)
+                    VALUES ('gruppa', 'Gruppa krovi', 'Kino');",
+            )
+            .unwrap();
+        let catalog = Catalog::with_connection(catalog.connection).unwrap();
+        let flags: Vec<_> = catalog
+            .artists()
+            .unwrap()
+            .into_iter()
+            .map(|artist| (artist.name, artist.flag))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                // The Soviet Union has no flag to show.
+                ("Kino".to_owned(), None),
+                (
+                    "Michael Jackson".to_owned(),
+                    Some("flags/us.svg".to_owned())
+                ),
             ]
         );
     }

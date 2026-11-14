@@ -815,7 +815,7 @@ fn range_sql<T: Copy>(
 
 /// The key Music Library files artist info under: trimmed, lowercase, with
 /// Unicode dashes made plain.
-fn artist_key_sql(field: &str) -> String {
+pub fn artist_key_sql(field: &str) -> String {
     let normalized = [8208, 8209, 8210, 8211, 8212, 8722]
         .iter()
         .fold(format!("COALESCE({field}, '')"), |expression, codepoint| {
@@ -1221,6 +1221,7 @@ mod tests {
         let artist = |name: &str, albums: Vec<Album>| Artist {
             name: name.to_owned(),
             sort_key: name.to_lowercase(),
+            flag: None,
             albums,
         };
         // Positions: 0 ABBA/Waterloo, 1 ABBA/Arrival, 2 Kiss/Destroyer, 3 Kiss/Unknown.
