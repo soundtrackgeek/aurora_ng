@@ -92,12 +92,31 @@ pub(crate) mod color {
     pub const WAVE_END: u32 = 0x1e5f5a;
 }
 
-/// An item in the cover wall's list: a row of covers, or the details of the
-/// open album, which sits right under its row.
+/// An item in the cover wall's list: a row of covers (or a `group:`
+/// header), or the details of the open album, which sits right under its row.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum WallItem {
     Row(usize),
     Details,
+}
+
+/// A row of the cover wall.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum WallRow {
+    /// The header of `wall_groups[group]`, above its covers.
+    Header { group: usize },
+    /// The covers at wall positions `start..end`.
+    Covers { start: usize, end: usize },
+}
+
+impl WallRow {
+    /// The first wall position on or after the row.
+    fn start(self, groups: &[search::WallGroup]) -> usize {
+        match self {
+            Self::Header { group } => groups[group].start,
+            Self::Covers { start, .. } => start,
+        }
+    }
 }
 
 enum UpdateState {
@@ -205,6 +224,13 @@ pub struct AuroraApp {
     /// The cover wall's order from `sort:`; the wall lists artist by artist
     /// without one.
     sort: Option<search::Sort>,
+    /// What `group:` puts the wall's albums together by.
+    group: Option<search::WallGrouping>,
+    /// The groups on the wall, in wall order. Empty without a group.
+    wall_groups: Vec<search::WallGroup>,
+    /// The wall's rows for the current columns: covers, and headers when
+    /// grouping.
+    wall_rows: Vec<WallRow>,
     /// The draw `sort:random` shows; a new seed shuffles again.
     shuffle_seed: u64,
     /// Wall position → album, counting albums artist by artist. Empty
@@ -409,6 +435,9 @@ impl AuroraApp {
             search_interrupt: None,
             filtered: false,
             sort: None,
+            group: None,
+            wall_groups: Vec::new(),
+            wall_rows: Vec::new(),
             shuffle_seed: settings.shuffle_seed.unwrap_or_else(search::new_seed),
             wall_order: Vec::new(),
             wall_position: Vec::new(),
@@ -659,9 +688,9 @@ impl AuroraApp {
         }
         cx.notify();
 
-        let parsed = search::split_sort(&query)
-            .and_then(|(filter, sort)| search::parse(&filter).map(|parsed| (parsed, sort)));
-        let (parsed, sort) = match parsed {
+        let parsed = search::split_view(&query)
+            .and_then(|(filter, view)| search::parse(&filter).map(|parsed| (parsed, view)));
+        let (parsed, view) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.search_state = SearchState::Failed(error);
@@ -669,10 +698,11 @@ impl AuroraApp {
             }
         };
         if parsed.is_empty() {
-            // Nothing to filter, though there may be a sort.
+            // Nothing to filter, though there may be a sort or group.
             self.search_state = SearchState::Idle;
             self.search = (!query.is_empty()).then_some(query);
-            self.sort = sort;
+            self.sort = view.sort;
+            self.group = view.group;
             self.show_matches(None, cx);
             return true;
         }
@@ -691,7 +721,7 @@ impl AuroraApp {
             .spawn(async move { catalog.search_album_ids(&parsed) });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
-            this.update(cx, |this, cx| this.finish_search(query, sort, result, cx))
+            this.update(cx, |this, cx| this.finish_search(query, view, result, cx))
                 .ok();
         }));
         true
@@ -700,7 +730,7 @@ impl AuroraApp {
     fn finish_search(
         &mut self,
         query: String,
-        sort: Option<search::Sort>,
+        view: search::View,
         result: Result<HashSet<String>, String>,
         cx: &mut Context<Self>,
     ) {
@@ -714,7 +744,8 @@ impl AuroraApp {
             Ok(ids) => {
                 self.search_state = SearchState::Idle;
                 self.search = Some(query);
-                self.sort = sort;
+                self.sort = view.sort;
+                self.group = view.group;
                 self.show_matches(Some(&ids), cx);
             }
             Err(error) => self.search_state = SearchState::Failed(error),
@@ -756,6 +787,7 @@ impl AuroraApp {
                         name: artist.name.clone(),
                         sort_key: artist.sort_key.clone(),
                         flag: artist.flag.clone(),
+                        country: artist.country.clone(),
                         albums,
                     })
                 })
@@ -803,12 +835,17 @@ impl AuroraApp {
         cx.notify();
     }
 
-    /// Works out the wall order for the sort, if there is one.
+    /// Works out the wall order for the sort and group, if there are any.
     fn update_wall_order(&mut self) {
         self.wall_order = match self.sort {
             Some(sort) => search::wall_order(&self.artists, sort, self.shuffle_seed),
             None => Vec::new(),
         };
+        self.wall_groups = Vec::new();
+        if let Some(group) = self.group {
+            let order = std::mem::take(&mut self.wall_order);
+            (self.wall_order, self.wall_groups) = search::group_wall(&self.artists, order, group);
+        }
         self.wall_position = vec![0; self.wall_order.len()];
         for (position, &album) in self.wall_order.iter().enumerate() {
             self.wall_position[album] = position;
@@ -1016,18 +1053,48 @@ impl AuroraApp {
         self.wall_position.get(album).copied().unwrap_or(album)
     }
 
-    /// The number of rows of covers.
-    fn wall_rows(&self) -> usize {
-        self.album_count.div_ceil(self.wall_columns)
+    /// Lays the wall out in rows of covers for the current columns. With a
+    /// group, each group starts on a new row under its header.
+    fn build_wall_rows(&mut self) {
+        let columns = self.wall_columns.max(1);
+        let covers = |rows: &mut Vec<WallRow>, start: usize, end: usize| {
+            rows.extend(
+                (start..end)
+                    .step_by(columns)
+                    .map(|row_start| WallRow::Covers {
+                        start: row_start,
+                        end: (row_start + columns).min(end),
+                    }),
+            );
+        };
+        let mut rows = Vec::new();
+        if self.wall_groups.is_empty() {
+            covers(&mut rows, 0, self.album_count);
+        } else {
+            for (ix, group) in self.wall_groups.iter().enumerate() {
+                rows.push(WallRow::Header { group: ix });
+                covers(&mut rows, group.start, group.start + group.len);
+            }
+        }
+        self.wall_rows = rows;
+    }
+
+    /// The row of covers wall position `ix` is in.
+    fn row_of(&self, ix: usize) -> usize {
+        // A header starts where its first row of covers does, so this finds
+        // the covers.
+        self.wall_rows
+            .partition_point(|row| row.start(&self.wall_groups) <= ix)
+            .saturating_sub(1)
     }
 
     /// The row the open album's details follow.
     fn details_row(&self) -> Option<usize> {
-        self.open_album.map(|ix| ix / self.wall_columns)
+        self.open_album.map(|ix| self.row_of(ix))
     }
 
     fn wall_item_count(&self) -> usize {
-        self.wall_rows() + usize::from(self.open_album.is_some())
+        self.wall_rows.len() + usize::from(self.open_album.is_some())
     }
 
     fn wall_item(&self, item: usize) -> WallItem {
@@ -1053,13 +1120,17 @@ impl AuroraApp {
             return 0;
         }
         match self.wall_item(top.item_ix) {
-            WallItem::Row(row) => row * self.wall_columns,
+            WallItem::Row(row) => self
+                .wall_rows
+                .get(row)
+                .map_or(0, |row| row.start(&self.wall_groups)),
             WallItem::Details => self.open_album.unwrap_or(0),
         }
     }
 
     /// Makes the list match the rows, forgetting every measured height.
     fn reset_wall_items(&mut self) {
+        self.build_wall_rows();
         let old = self.wall_list.item_count();
         self.wall_list.splice(0..old, self.wall_item_count());
     }
@@ -1067,7 +1138,12 @@ impl AuroraApp {
     /// Scrolls so the row with wall position `ix` is at the top.
     fn scroll_wall_to_album(&mut self, ix: usize) {
         let ix = ix.min(self.album_count.saturating_sub(1));
-        let item = self.row_item(ix / self.wall_columns);
+        let mut row = self.row_of(ix);
+        // The first row of a group shows with its header.
+        if row > 0 && matches!(self.wall_rows[row - 1], WallRow::Header { .. }) {
+            row -= 1;
+        }
+        let item = self.row_item(row);
         self.wall_list.scroll_to(ListOffset {
             item_ix: item,
             offset_in_item: px(0.),
@@ -1079,7 +1155,7 @@ impl AuroraApp {
     fn open_details(&mut self, ix: usize) {
         self.close_details();
         self.open_album = Some(ix);
-        let item = ix / self.wall_columns + 1;
+        let item = self.row_of(ix) + 1;
         self.wall_list.splice(item..item, 1);
         self.reveal_details = 4;
     }
@@ -2293,21 +2369,25 @@ impl AuroraApp {
         let wall = list(
             self.wall_list.clone(),
             cx.processor(move |this, item: usize, _, cx| match this.wall_item(item) {
-                WallItem::Row(row) => {
-                    let start = row * this.wall_columns;
-                    let end = (start + this.wall_columns).min(this.album_count);
-                    let tiles: Vec<_> = (start..end)
-                        .map(|ix| this.render_tile(ix, tile, show_text, cx))
-                        .collect();
-                    div()
-                        .h(row_height)
-                        .pt(gap)
-                        .pl(inset)
-                        .flex()
-                        .gap(gap)
-                        .children(tiles)
-                        .into_any_element()
-                }
+                WallItem::Row(row) => match this.wall_rows.get(row).copied() {
+                    Some(WallRow::Header { group }) => this
+                        .render_group_header(group, inset, gap)
+                        .into_any_element(),
+                    Some(WallRow::Covers { start, end }) => {
+                        let tiles: Vec<_> = (start..end)
+                            .map(|ix| this.render_tile(ix, tile, show_text, cx))
+                            .collect();
+                        div()
+                            .h(row_height)
+                            .pt(gap)
+                            .pl(inset)
+                            .flex()
+                            .gap(gap)
+                            .children(tiles)
+                            .into_any_element()
+                    }
+                    None => div().into_any_element(),
+                },
                 WallItem::Details => div()
                     .pt(gap)
                     .pl(inset)
@@ -2336,6 +2416,31 @@ impl AuroraApp {
                 )
             })
             .child(div().flex_1().min_h_0().child(wall))
+    }
+
+    /// The name of a `group:` over its covers, with how many albums it has.
+    fn render_group_header(&self, group: usize, inset: Pixels, gap: Pixels) -> Div {
+        let group = &self.wall_groups[group];
+        let count = match group.len {
+            1 => "1 album".to_owned(),
+            n => format!("{} albums", thousands(n)),
+        };
+        div()
+            .pt(gap * 2.)
+            .pl(inset)
+            .pr(inset)
+            .flex()
+            .items_baseline()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(group.label.clone()),
+            )
+            .child(muted(count))
     }
 
     fn render_tile(

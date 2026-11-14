@@ -22,7 +22,7 @@ Version **0.17.0** browses and searches your library, shows a wall of album cove
 
   Fields: `artist:` (track artist), `aartist:` (album artist), `album:`, `title:`, `genre:`, `publisher:`, `country:`, `year:` (original year), `ryear:` (release year), `cr:` (rating completeness %), `love:` (loved tracks), `single:` (official singles), `minutes:`, `ar:` (album rating, 0–5), `bb:`, `uk:`, `vg:` (chart ranks), `born:`, `dead:`, `founded:`, `dissolved:`. Unquoted words match word beginnings; quotes match the whole value exactly. Combine with `AND` or a comma, `OR` (the value after it keeps the field: `year:1985 OR 1987`) and `NOT` or a leading `-`; operators must be uppercase. Ranges use `..` and include both ends: `year:1985..`, `cr:50..80`, `love:..3`. `genre:scores` stands for the film, TV and game score genres (Action, Animation, Comedy, Documentary, Drama, Fantasy, Horror, Sci-Fi, Thriller, TV, Video Game, Western, Anime). `sonic:` is not available, since it needs Aurora's audio analysis. A query that is not valid shows what is wrong next to the box.
 
-  **Sorting the cover wall** (Aurora NG only; Aurora has no `sort:`): add one `sort:` anywhere in the query, on its own or with a search, separated by a space, comma or `AND`, like `genre:scores sort:random` or `year:1980..1989, sort:..year`. It changes the order of the cover wall; the columns keep their artist order.
+  **Sorting the cover wall**: add one `sort:` anywhere in the query, on its own or with a search, separated by a space, comma or `AND`, like `genre:scores sort:random` or `year:1980..1989, sort:..year`. It changes the order of the cover wall; the columns keep their artist order. Aurora has the same `sort:` in Songs and Albums.
 
   | Sort | Order |
   | --- | --- |
@@ -33,6 +33,21 @@ Version **0.17.0** browses and searches your library, shows a wall of album cove
   | `sort:az` / `sort:za` | Short for `sort:album az` / `sort:album za` |
 
   Without `az` or `za`, `sort:album` and `sort:aartist` sort A–Z. Albums in the same year are ordered by artist, then title; albums with the same title by artist, then year. The shuffled order is remembered, so the app opens with the same draw after a restart.
+
+  **Grouping the cover wall**: add one `group:` the same way, like `group:genre`, `year:1980..1989 group:country` or `group:decade sort:random`. The wall then shows each group under a header with its name and album count, and each group starts on a new row. Within a group the albums keep the `sort:` order, or artist order without one. Albums with no value (no genre, no year, not rated) come last, under "No genre", "No year" and so on. Aurora has the same `group:`.
+
+  | Group | Groups by | Order |
+  | --- | --- | --- |
+  | `group:genre` | Genre | A–Z |
+  | `group:aartist` | Album artist | A–Z |
+  | `group:publisher` | Publisher or label | A–Z |
+  | `group:country` | The country the album artist is from, as Music Library found it on MusicBrainz | A–Z |
+  | `group:year` | Original year | Oldest first |
+  | `group:decade` | Decade of the original year, like "1980s" | Oldest first |
+  | `group:love` | Number of loved tracks | Most loved first |
+  | `group:ar` | Album rating, in half stars, like "4.5 stars" | Highest first |
+
+  Add `za` (or `az`) after a text group to reverse it, like `group:genre za`. Numeric groups use the `..` of `sort:year..`: `group:year..` / `group:..year` for oldest / newest first, and `group:love..` or `group:ar..` for lowest first.
 - **Country flags**: the flag of the country an artist is from is shown before their name, as in Aurora, under each cover and in the album details header, like "🇬🇧 Chateaux · 1983". The country comes from Music Library's MusicBrainz lookups; artists without one show no flag.
 - **Charts and singles**, as in Aurora, from what Music Library knows (nothing is looked up online):
   - Albums show their best position on the album charts, each with its country's flag: 🇺🇸 Billboard, 🇬🇧 Official UK and 🇳🇴 VG Lista, like "🇺🇸 #1 🇬🇧 #1 🇳🇴 #3" for Thriller. They are under big covers and in the album details header.

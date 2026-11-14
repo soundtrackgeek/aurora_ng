@@ -22,6 +22,8 @@ pub struct Album {
     pub rating: Option<i64>,
     /// Music Library's Album Score: an open-ended ranking number, not stars.
     pub score: Option<f64>,
+    /// How many of the album's tracks are marked Love.
+    pub loved_tracks: Option<i64>,
     /// The folder the album's files are in, like `D:\MUSIC\Kittie - Oracle (2001)`.
     pub folder: Option<String>,
     /// Filled in from the covers folder after loading.
@@ -101,6 +103,8 @@ pub struct Artist {
     /// The flag of the country MusicBrainz says the artist is from, like
     /// "flags/gb.svg".
     pub flag: Option<String>,
+    /// The name of that country, like "United Kingdom".
+    pub country: Option<String>,
     pub albums: Vec<Album>,
 }
 
@@ -157,6 +161,10 @@ pub struct Catalog {
     has_singles: bool,
     /// Music Library looks up where artists are from on MusicBrainz.
     has_origins: bool,
+    /// Newer catalogs name the country as well as giving its code.
+    has_origin_names: bool,
+    /// Albums count their loved tracks.
+    has_loved_tracks: bool,
 }
 
 impl Catalog {
@@ -190,10 +198,24 @@ impl Catalog {
         };
         let has_singles = has_table("track_singles")?;
         let has_origins = has_table("musicbrainz_artist_origin_countries")?;
+        let has_column = |table: &str, column: &str| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Could not read the catalog: {error}"))
+        };
+        let has_origin_names =
+            has_origins && has_column("musicbrainz_artist_origin_countries", "country_name")?;
+        let has_loved_tracks = has_column("albums", "loved_tracks")?;
         Ok(Self {
             connection,
             has_singles,
             has_origins,
+            has_origin_names,
+            has_loved_tracks,
         })
     }
 
@@ -213,13 +235,25 @@ impl Catalog {
     /// Every album artist with their albums, sorted by name, then by year.
     pub fn artists(&self) -> Result<Vec<Artist>, String> {
         let country = if self.has_origins {
+            let key = crate::search::artist_key_sql("a.album_artist_display");
+            let name = if self.has_origin_names {
+                "COALESCE(NULLIF(TRIM(o.country_name), ''), o.country_code)"
+            } else {
+                "o.country_code"
+            };
             format!(
                 "(SELECT o.country_code FROM musicbrainz_artist_origin_countries o
-                  WHERE o.local_artist_key = {})",
-                crate::search::artist_key_sql("a.album_artist_display")
+                  WHERE o.local_artist_key = {key}),
+                 (SELECT {name} FROM musicbrainz_artist_origin_countries o
+                  WHERE o.local_artist_key = {key})"
             )
         } else {
-            "NULL".to_owned()
+            "NULL, NULL".to_owned()
+        };
+        let loved = if self.has_loved_tracks {
+            "a.loved_tracks"
+        } else {
+            "NULL"
         };
         let mut statement = self
             .connection
@@ -228,7 +262,8 @@ impl Catalog {
                         (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
                         a.publisher, a.total_tracks, a.total_seconds,
                         a.effective_album_rating, a.album_score, a.canonical_genre,
-                        a.billboard_rank, a.official_uk_rank, a.vg_lista_rank, {country}
+                        a.billboard_rank, a.official_uk_rank, a.vg_lista_rank, {country},
+                        {loved}
                  FROM albums a"
             ))
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -248,6 +283,8 @@ impl Catalog {
                     row.get::<_, Option<String>>(10)?,
                     chart_peaks(&Chart::ALBUMS, &[row.get(11)?, row.get(12)?, row.get(13)?]),
                     row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -268,6 +305,8 @@ impl Catalog {
                 genre,
                 charts,
                 country,
+                country_name,
+                loved_tracks,
             ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
@@ -275,10 +314,14 @@ impl Catalog {
                 name,
                 sort_key,
                 flag: None,
+                country: None,
                 albums: Vec::new(),
             });
             if artist.flag.is_none() {
                 artist.flag = country.as_deref().and_then(crate::flags::path);
+            }
+            if artist.country.is_none() {
+                artist.country = non_empty(country_name);
             }
             artist.albums.push(Album {
                 id,
@@ -290,6 +333,7 @@ impl Catalog {
                 total_seconds,
                 rating,
                 score,
+                loved_tracks,
                 folder: non_empty(folder),
                 cover: None,
                 charts,
@@ -519,9 +563,9 @@ mod tests {
             .connection
             .execute_batch(
                 "CREATE TABLE musicbrainz_artist_origin_countries (local_artist_key TEXT
-                    PRIMARY KEY, country_code TEXT);
+                    PRIMARY KEY, country_code TEXT, country_name TEXT);
                  INSERT INTO musicbrainz_artist_origin_countries
-                    VALUES ('michael jackson', 'US'), ('kino', 'SU');
+                    VALUES ('michael jackson', 'US', 'United States'), ('kino', 'SU', NULL);
                  INSERT INTO albums (id, album, album_artist_display)
                     VALUES ('gruppa', 'Gruppa krovi', 'Kino');",
             )
@@ -531,16 +575,17 @@ mod tests {
             .artists()
             .unwrap()
             .into_iter()
-            .map(|artist| (artist.name, artist.flag))
+            .map(|artist| (artist.name, artist.flag, artist.country))
             .collect();
         assert_eq!(
             flags,
             [
-                // The Soviet Union has no flag to show.
-                ("Kino".to_owned(), None),
+                // The Soviet Union has no flag to show; without a name, the code is used.
+                ("Kino".to_owned(), None, Some("SU".to_owned())),
                 (
                     "Michael Jackson".to_owned(),
-                    Some("flags/us.svg".to_owned())
+                    Some("flags/us.svg".to_owned()),
+                    Some("United States".to_owned())
                 ),
             ]
         );

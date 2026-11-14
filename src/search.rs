@@ -634,10 +634,10 @@ pub fn parse(input: &str) -> Result<Search, String> {
     Ok(Search { groups })
 }
 
-// ── Sorting ─────────────────────────────────────────────────────────────
+// ── Sorting and grouping ────────────────────────────────────────────────
 
-/// How the cover wall orders its albums. Aurora has no `sort:`; it is
-/// Aurora NG's own, and it does not filter anything.
+/// How the cover wall orders its albums. Like Aurora's `sort:`, it does not
+/// filter anything.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sort {
     Random,
@@ -653,73 +653,172 @@ pub enum Sort {
     },
 }
 
-const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az or sort:aartist za.";
+/// What `group:` puts the cover wall's albums together by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GroupField {
+    Genre,
+    AlbumArtist,
+    Publisher,
+    Country,
+    Year,
+    Decade,
+    Love,
+    AlbumRating,
+}
 
-/// Takes the `sort:` clause out of a query, wherever it is, and returns the
-/// rest of the query with the sort. `sort:album` and `sort:aartist` may be
-/// followed by `az` or `za` after a space.
-pub fn split_sort(input: &str) -> Result<(String, Option<Sort>), String> {
+impl GroupField {
+    /// Text groups go A–Z by default; years oldest first; Love and album
+    /// rating highest first.
+    fn descending_by_default(self) -> bool {
+        matches!(self, Self::Love | Self::AlbumRating)
+    }
+
+    fn is_text(self) -> bool {
+        matches!(
+            self,
+            Self::Genre | Self::AlbumArtist | Self::Publisher | Self::Country
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WallGrouping {
+    pub field: GroupField,
+    /// Z–A, newest or lowest first, rather than the field's usual order.
+    pub descending: bool,
+}
+
+/// The `sort:` and `group:` in a query; they arrange the wall and filter
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct View {
+    pub sort: Option<Sort>,
+    pub group: Option<WallGrouping>,
+}
+
+const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az or sort:aartist za.";
+const GROUP_HELP: &str = "Use group:genre, group:aartist, group:publisher, group:country, group:year, group:decade, group:love or group:ar.";
+
+fn parse_sort(value: &str, descending: bool) -> Result<Sort, String> {
+    Ok(match value {
+        "random" => Sort::Random,
+        "year.." => Sort::YearAscending,
+        "..year" => Sort::YearDescending,
+        "az" => Sort::Album { descending: false },
+        "za" => Sort::Album { descending: true },
+        "album" | "albums" => Sort::Album { descending },
+        "aartist" => Sort::AlbumArtist { descending },
+        "" => return Err(format!("sort: needs a value. {SORT_HELP}")),
+        other => return Err(format!("Unknown sort \"{other}\". {SORT_HELP}")),
+    })
+}
+
+fn group_field(name: &str) -> Option<GroupField> {
+    Some(match name {
+        "genre" => GroupField::Genre,
+        "aartist" => GroupField::AlbumArtist,
+        "publisher" => GroupField::Publisher,
+        "country" => GroupField::Country,
+        "year" => GroupField::Year,
+        "decade" => GroupField::Decade,
+        "love" => GroupField::Love,
+        "ar" => GroupField::AlbumRating,
+        _ => return None,
+    })
+}
+
+/// `genre`, `genre za`, `year`, `year..`, `..year`: `direction` is the
+/// `az`/`za` after a text field.
+fn parse_group(value: &str, direction: Option<bool>) -> Result<WallGrouping, String> {
+    if value.is_empty() {
+        return Err(format!("group: needs a value. {GROUP_HELP}"));
+    }
+    let unknown = || format!("Unknown group \"{value}\". {GROUP_HELP}");
+    let (name, descending) = if let Some(name) = value.strip_suffix("..") {
+        (name, Some(false))
+    } else if let Some(name) = value.strip_prefix("..") {
+        (name, Some(true))
+    } else {
+        (value, direction)
+    };
+    let field = group_field(name).ok_or_else(unknown)?;
+    // `..` orders numbers; `az`/`za` order text.
+    if value.contains("..") && field.is_text() {
+        return Err(unknown());
+    }
+    Ok(WallGrouping {
+        field,
+        descending: descending.unwrap_or(field.descending_by_default()),
+    })
+}
+
+/// Takes the `sort:` and `group:` clauses out of a query, wherever they are,
+/// and returns the rest of the query with them. `sort:album`,
+/// `sort:aartist` and the text groups may be followed by `az` or `za` after
+/// a space.
+pub fn split_view(input: &str) -> Result<(String, View), String> {
     let is_break = |ch: char| ch.is_whitespace() || ch == ',';
     let mut rest = String::new();
-    let mut sort = None;
+    let mut view = View::default();
     let mut quoted = false;
     let mut ix = 0;
     while let Some(ch) = input[ix..].chars().next() {
         let tail = &input[ix..];
         let at_word_start = input[..ix].chars().next_back().is_none_or(is_break);
-        let is_sort = !quoted
-            && at_word_start
-            && tail
-                .get(..4)
-                .is_some_and(|word| word.eq_ignore_ascii_case("sort"))
-            && matches!(tail[4..].chars().next(), Some(':' | '='));
-        if !is_sort {
+        let keyword = ["sort", "group"].into_iter().find(|keyword| {
+            tail.get(..keyword.len())
+                .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+                && matches!(tail[keyword.len()..].chars().next(), Some(':' | '='))
+        });
+        let Some(keyword) = keyword.filter(|_| !quoted && at_word_start) else {
             if ch == '"' {
                 quoted = !quoted;
             }
             rest.push(ch);
             ix += ch.len_utf8();
             continue;
-        }
+        };
 
-        let after = &tail[5..];
+        let after = &tail[keyword.len() + 1..];
         let end = after.find(is_break).unwrap_or(after.len());
         let value = after[..end].to_ascii_lowercase();
-        let mut consumed = 5 + end;
-        // An optional direction after `album` or `aartist`.
-        let mut descending = false;
-        if matches!(value.as_str(), "album" | "albums" | "aartist") {
+        let mut consumed = keyword.len() + 1 + end;
+        // An optional direction after a text value.
+        let takes_direction = if keyword == "sort" {
+            matches!(value.as_str(), "album" | "albums" | "aartist")
+        } else {
+            group_field(&value).is_some_and(GroupField::is_text)
+        };
+        let mut direction = None;
+        if takes_direction {
             let next = &after[end..];
             let spaces = next.len() - next.trim_start_matches(char::is_whitespace).len();
             let word_end = next[spaces..]
                 .find(is_break)
                 .map_or(next.len(), |end| spaces + end);
-            match next[spaces..word_end].to_ascii_lowercase().as_str() {
-                "az" => consumed += word_end,
-                "za" => {
-                    descending = true;
-                    consumed += word_end;
-                }
-                _ => {}
+            direction = match next[spaces..word_end].to_ascii_lowercase().as_str() {
+                "az" => Some(false),
+                "za" => Some(true),
+                _ => None,
+            };
+            if direction.is_some() {
+                consumed += word_end;
             }
         }
-        let parsed = match value.as_str() {
-            "random" => Sort::Random,
-            "year.." => Sort::YearAscending,
-            "..year" => Sort::YearDescending,
-            "az" => Sort::Album { descending: false },
-            "za" => Sort::Album { descending: true },
-            "album" | "albums" => Sort::Album { descending },
-            "aartist" => Sort::AlbumArtist { descending },
-            "" => return Err(format!("sort: needs a value. {SORT_HELP}")),
-            other => return Err(format!("Unknown sort \"{other}\". {SORT_HELP}")),
-        };
-        if sort.replace(parsed).is_some() {
-            return Err("Use one sort: per search.".to_owned());
+        if keyword == "sort" {
+            let parsed = parse_sort(&value, direction.unwrap_or(false))?;
+            if view.sort.replace(parsed).is_some() {
+                return Err("Use one sort: per search.".to_owned());
+            }
+        } else {
+            let parsed = parse_group(&value, direction)?;
+            if view.group.replace(parsed).is_some() {
+                return Err("Use one group: per search.".to_owned());
+            }
         }
         ix += consumed;
     }
-    Ok((rest, sort))
+    Ok((rest, view))
 }
 
 /// A seed for `sort:random`; a new one gives a new draw.
@@ -789,6 +888,130 @@ fn shuffle(order: &mut [usize], seed: u64) {
         let j = (next() % (i as u64 + 1)) as usize;
         order.swap(i, j);
     }
+}
+
+/// A run of albums on the wall that share a `group:` value, under a header.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WallGroup {
+    pub label: String,
+    /// The wall position of the group's first album.
+    pub start: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupKey {
+    Number(i64),
+    Text(String),
+}
+
+/// The key and label of one album's group; `None` when it has no value.
+fn group_key(
+    artist: &crate::library::Artist,
+    album: &crate::library::Album,
+    field: GroupField,
+) -> Option<(GroupKey, String)> {
+    let text = |value: Option<&str>| {
+        value.map(|value| (GroupKey::Text(value.to_lowercase()), value.to_owned()))
+    };
+    match field {
+        GroupField::Genre => text(album.genre.as_deref()),
+        GroupField::AlbumArtist => {
+            Some((GroupKey::Text(artist.sort_key.clone()), artist.name.clone()))
+        }
+        GroupField::Publisher => text(album.publisher.as_deref()),
+        GroupField::Country => text(artist.country.as_deref()),
+        GroupField::Year => album
+            .year
+            .map(|year| (GroupKey::Number(year), year.to_string())),
+        GroupField::Decade => album.year.map(|year| {
+            let decade = year.div_euclid(10) * 10;
+            (GroupKey::Number(decade), format!("{decade}s"))
+        }),
+        GroupField::Love => {
+            let loved = album.loved_tracks.unwrap_or(0).max(0);
+            let label = match loved {
+                0 => "No loved tracks".to_owned(),
+                1 => "1 loved track".to_owned(),
+                n => format!("{n} loved tracks"),
+            };
+            Some((GroupKey::Number(loved), label))
+        }
+        // Half stars: 0–100 in steps of 10.
+        GroupField::AlbumRating => album.rating.filter(|&rating| rating > 0).map(|rating| {
+            let half_stars = ((rating.min(100) + 5) / 10).max(1);
+            let stars = half_stars as f64 / 2.;
+            let label = if half_stars == 2 {
+                "1 star".to_owned()
+            } else {
+                format!("{stars} stars")
+            };
+            (GroupKey::Number(half_stars), label)
+        }),
+    }
+}
+
+fn missing_label(field: GroupField) -> &'static str {
+    match field {
+        GroupField::Genre => "No genre",
+        GroupField::AlbumArtist => "No album artist",
+        GroupField::Publisher => "No publisher",
+        GroupField::Country => "No country",
+        GroupField::Year | GroupField::Decade => "No year",
+        GroupField::Love => "No loved tracks",
+        GroupField::AlbumRating => "Not rated",
+    }
+}
+
+/// Puts the wall's albums together by `group`, keeping the order they are
+/// in (`order`, or artist by artist when it is empty) within each group,
+/// and lists the groups. Albums without a value go last.
+pub fn group_wall(
+    artists: &[crate::library::Artist],
+    order: Vec<usize>,
+    group: WallGrouping,
+) -> (Vec<usize>, Vec<WallGroup>) {
+    let albums: Vec<_> = artists
+        .iter()
+        .flat_map(|artist| artist.albums.iter().map(move |album| (artist, album)))
+        .collect();
+    let mut order = if order.is_empty() {
+        (0..albums.len()).collect()
+    } else {
+        order
+    };
+    let keys: Vec<Option<(GroupKey, String)>> = albums
+        .iter()
+        .map(|(artist, album)| group_key(artist, album, group.field))
+        .collect();
+    order.sort_by(|&a, &b| match (&keys[a], &keys[b]) {
+        (Some((a, _)), Some((b, _))) if group.descending => b.cmp(a),
+        (Some((a, _)), Some((b, _))) => a.cmp(b),
+        (a, b) => b.is_some().cmp(&a.is_some()),
+    });
+
+    let mut groups: Vec<WallGroup> = Vec::new();
+    let mut previous: Option<Option<&GroupKey>> = None;
+    for (position, &album) in order.iter().enumerate() {
+        let key = keys[album].as_ref().map(|(key, _)| key);
+        if previous == Some(key) {
+            if let Some(last) = groups.last_mut() {
+                last.len += 1;
+            }
+            continue;
+        }
+        previous = Some(key);
+        let label = keys[album].as_ref().map_or_else(
+            || missing_label(group.field).to_owned(),
+            |(_, label)| label.clone(),
+        );
+        groups.push(WallGroup {
+            label,
+            start: position,
+            len: 1,
+        });
+    }
+    (order, groups)
 }
 
 // ── SQL ─────────────────────────────────────────────────────────────────
@@ -1160,7 +1383,11 @@ mod tests {
 
     #[test]
     fn takes_the_sort_out_of_a_query() {
-        let split = |query: &str| split_sort(query).unwrap();
+        let split = |query: &str| {
+            let (rest, view) = split_view(query).unwrap();
+            assert_eq!(view.group, None);
+            (rest, view.sort)
+        };
         assert_eq!(split("sort:random"), (String::new(), Some(Sort::Random)));
         assert_eq!(
             split("year:1981 sort:az"),
@@ -1196,9 +1423,71 @@ mod tests {
         assert_eq!(split("aartist:resort:az").1, None);
         assert!(parse(&split("year:1981 AND sort:year..").0).is_ok());
 
-        assert!(split_sort("sort:").is_err());
-        assert!(split_sort("sort:sideways").is_err());
-        assert!(split_sort("sort:az sort:za").is_err());
+        assert!(split_view("sort:").is_err());
+        assert!(split_view("sort:sideways").is_err());
+        assert!(split_view("sort:az sort:za").is_err());
+    }
+
+    #[test]
+    fn takes_the_group_out_of_a_query() {
+        let group = |field, descending| Some(WallGrouping { field, descending });
+        let split = |query: &str| split_view(query).unwrap();
+        assert_eq!(
+            split("group:genre"),
+            (
+                String::new(),
+                View {
+                    sort: None,
+                    group: group(GroupField::Genre, false)
+                }
+            )
+        );
+        assert_eq!(
+            split("year:1980..1989 group:country za sort:random"),
+            (
+                "year:1980..1989  ".to_owned(),
+                View {
+                    sort: Some(Sort::Random),
+                    group: group(GroupField::Country, true)
+                }
+            )
+        );
+        // Years go oldest first, Love and album rating highest first.
+        assert_eq!(split("group:year").1.group, group(GroupField::Year, false));
+        assert_eq!(split("group:..year").1.group, group(GroupField::Year, true));
+        assert_eq!(
+            split("GROUP=Decade").1.group,
+            group(GroupField::Decade, false)
+        );
+        assert_eq!(split("group:love").1.group, group(GroupField::Love, true));
+        assert_eq!(
+            split("group:love..").1.group,
+            group(GroupField::Love, false)
+        );
+        assert_eq!(
+            split("group:ar").1.group,
+            group(GroupField::AlbumRating, true)
+        );
+        assert_eq!(
+            split("group:aartist za").1.group,
+            group(GroupField::AlbumArtist, true)
+        );
+        assert_eq!(
+            split("group:publisher, genre:rock"),
+            (
+                ", genre:rock".to_owned(),
+                View {
+                    sort: None,
+                    group: group(GroupField::Publisher, false)
+                }
+            )
+        );
+        assert_eq!(split("title:\"group:genre\"").1.group, None);
+
+        assert!(split_view("group:").is_err());
+        assert!(split_view("group:mood").is_err());
+        assert!(split_view("group:genre..").is_err());
+        assert!(split_view("group:genre group:year").is_err());
     }
 
     #[test]
@@ -1214,6 +1503,7 @@ mod tests {
             total_seconds: None,
             rating: None,
             score: None,
+            loved_tracks: None,
             folder: None,
             cover: None,
             charts: Vec::new(),
@@ -1222,6 +1512,7 @@ mod tests {
             name: name.to_owned(),
             sort_key: name.to_lowercase(),
             flag: None,
+            country: None,
             albums,
         };
         // Positions: 0 ABBA/Waterloo, 1 ABBA/Arrival, 2 Kiss/Destroyer, 3 Kiss/Unknown.
@@ -1251,6 +1542,113 @@ mod tests {
         );
         shuffled.sort();
         assert_eq!(shuffled, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn groups_the_wall() {
+        use crate::library::{Album, Artist};
+        let album =
+            |title: &str, year: Option<i64>, rating: Option<i64>, loved: Option<i64>| Album {
+                id: title.to_owned(),
+                title: title.to_owned(),
+                year,
+                publisher: None,
+                genre: (year.is_some()).then(|| "Rock".to_owned()),
+                total_tracks: None,
+                total_seconds: None,
+                rating,
+                score: None,
+                loved_tracks: loved,
+                folder: None,
+                cover: None,
+                charts: Vec::new(),
+            };
+        let artist = |name: &str, country: Option<&str>, albums: Vec<Album>| Artist {
+            name: name.to_owned(),
+            sort_key: name.to_lowercase(),
+            flag: None,
+            country: country.map(str::to_owned),
+            albums,
+        };
+        // Positions: 0 ABBA/Waterloo, 1 ABBA/Arrival, 2 Kiss/Destroyer, 3 Kiss/Unknown.
+        let artists = [
+            artist(
+                "ABBA",
+                Some("Sweden"),
+                vec![
+                    album("Waterloo", Some(1974), Some(80), Some(2)),
+                    album("Arrival", Some(1976), Some(90), Some(0)),
+                ],
+            ),
+            artist(
+                "Kiss",
+                Some("United States"),
+                vec![
+                    album("Destroyer", Some(1976), Some(84), Some(2)),
+                    album("Unknown", None, None, None),
+                ],
+            ),
+        ];
+        let grouped = |order: Vec<usize>, field, descending| {
+            let (order, groups) = group_wall(&artists, order, WallGrouping { field, descending });
+            let groups: Vec<(String, usize, usize)> = groups
+                .into_iter()
+                .map(|group| (group.label, group.start, group.len))
+                .collect();
+            (order, groups)
+        };
+        let group = |label: &str, start, len| (label.to_owned(), start, len);
+
+        assert_eq!(
+            grouped(Vec::new(), GroupField::Country, false),
+            (
+                vec![0, 1, 2, 3],
+                vec![group("Sweden", 0, 2), group("United States", 2, 2)]
+            )
+        );
+        // Albums without a year go last; within a year, the sort's order stays.
+        assert_eq!(
+            grouped(vec![3, 2, 1, 0], GroupField::Year, true),
+            (
+                vec![2, 1, 0, 3],
+                vec![
+                    group("1976", 0, 2),
+                    group("1974", 2, 1),
+                    group("No year", 3, 1)
+                ]
+            )
+        );
+        assert_eq!(
+            grouped(Vec::new(), GroupField::Decade, false).1,
+            [group("1970s", 0, 3), group("No year", 3, 1)]
+        );
+        assert_eq!(
+            grouped(Vec::new(), GroupField::Genre, false).1,
+            [group("Rock", 0, 3), group("No genre", 3, 1)]
+        );
+        // Most loved first; no count is none loved.
+        assert_eq!(
+            grouped(Vec::new(), GroupField::Love, true),
+            (
+                vec![0, 2, 1, 3],
+                vec![
+                    group("2 loved tracks", 0, 2),
+                    group("No loved tracks", 2, 2)
+                ]
+            )
+        );
+        // Half stars: 80 is four, 84 rounds to four, 90 is four and a half.
+        assert_eq!(
+            grouped(Vec::new(), GroupField::AlbumRating, true),
+            (
+                vec![1, 0, 2, 3],
+                vec![
+                    group("4.5 stars", 0, 1),
+                    group("4 stars", 1, 2),
+                    group("Not rated", 3, 1)
+                ]
+            )
+        );
     }
 
     fn ids(connection: &Connection, query: &str) -> Vec<String> {

@@ -2,6 +2,13 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.19.0] - 2026-11-14
+
+### Added
+
+- `group:` in the search box groups the cover wall under headers that show each group's name and album count: `group:genre`, `group:aartist`, `group:publisher`, `group:country`, `group:year`, `group:decade`, `group:love` (loved-track count) and `group:ar` (album rating in half stars). Each group starts on a new row, keeps the `sort:` order inside it, and albums without a value come last. Text groups take `az`/`za`; numeric groups take `..` like `group:..year`. It combines with any search and with `sort:`. Aurora gets the same `group:` and `sort:`.
+- Albums now carry their loved-track count and artists their country's name, read from Music Library's catalog. Older catalogs without these columns still load.
+
 ## [0.18.0] - 2026-11-14
 
 ### Added
