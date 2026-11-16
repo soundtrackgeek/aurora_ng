@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.21.0] - 2026-11-16
+
+### Added
+
+- `sound:` in the search finds albums by what they sound like: orchestral, choir, strings, piano, guitar, synth, hybrid, ambient, percussion, chiptune, jazz or vocals, like `genre:scores AND sound:synth AND year:1980..1989`. `group:sound` puts the cover wall's albums under their most common sound. The sounds come from Aurora 0.65.0 or newer, whose descriptor file Aurora NG reads; without it `sound:` finds nothing.
+
 ## [0.20.0] - 2026-11-16
 
 ### Added

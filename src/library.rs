@@ -30,6 +30,9 @@ pub struct Album {
     pub cover: Option<PathBuf>,
     /// Best album chart positions: Billboard, Official UK, VG Lista.
     pub charts: Vec<ChartPeak>,
+    /// The album's most common sound descriptor, from Aurora; filled in by a
+    /// `group:sound` search.
+    pub sound: Option<u8>,
 }
 
 /// The charts Music Library matches the library against.
@@ -179,6 +182,11 @@ impl Catalog {
         connection
             .busy_timeout(Duration::from_secs(2))
             .map_err(|error| format!("Could not configure the catalog: {error}"))?;
+        // Aurora's sound descriptors, for `sound:` and `group:sound`. Each
+        // search opens the catalog again, so it sees a file Aurora made since.
+        if let Some(cache) = crate::sound::cache_path() {
+            crate::sound::attach(&connection, &cache);
+        }
         connection
             .pragma_update(None, "query_only", true)
             .map_err(|error| format!("Could not make the catalog read-only: {error}"))?;
@@ -230,6 +238,11 @@ impl Catalog {
         search: &crate::search::Search,
     ) -> Result<HashSet<String>, String> {
         crate::search::album_ids(&self.connection, search)
+    }
+
+    /// Every album's most common sound descriptor, for `group:sound`.
+    pub fn sound_tops(&self) -> Result<std::collections::HashMap<String, u8>, String> {
+        crate::sound::album_tops(&self.connection)
     }
 
     /// Every album artist with their albums, sorted by name, then by year.
@@ -336,6 +349,7 @@ impl Catalog {
                 loved_tracks,
                 folder: non_empty(folder),
                 cover: None,
+                sound: None,
                 charts,
             });
         }

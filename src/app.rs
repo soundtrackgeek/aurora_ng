@@ -128,6 +128,10 @@ enum UpdateState {
     Failed(String),
 }
 
+/// The albums a search found (`None` for every album), and every album's
+/// sound descriptor when it groups by sound.
+type SearchResult = Result<(Option<HashSet<String>>, Option<HashMap<String, u8>>), String>;
+
 enum SearchState {
     Idle,
     /// The query being run.
@@ -697,7 +701,11 @@ impl AuroraApp {
                 return true;
             }
         };
-        if parsed.is_empty() {
+        // `group:sound` reads the albums' descriptors from Aurora's file.
+        let wants_sound = view
+            .group
+            .is_some_and(|group| group.field == search::GroupField::Sound);
+        if parsed.is_empty() && !wants_sound {
             // Nothing to filter, though there may be a sort or group.
             self.search_state = SearchState::Idle;
             self.search = (!query.is_empty()).then_some(query);
@@ -716,9 +724,15 @@ impl AuroraApp {
         };
         self.search_interrupt = Some(catalog.interrupt_handle());
         self.search_state = SearchState::Searching(query.clone());
-        let job = cx
-            .background_executor()
-            .spawn(async move { catalog.search_album_ids(&parsed) });
+        let job = cx.background_executor().spawn(async move {
+            let ids = if parsed.is_empty() {
+                None
+            } else {
+                Some(catalog.search_album_ids(&parsed)?)
+            };
+            let sound = wants_sound.then(|| catalog.sound_tops()).transpose()?;
+            Ok((ids, sound))
+        });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
             this.update(cx, |this, cx| this.finish_search(query, view, result, cx))
@@ -731,7 +745,7 @@ impl AuroraApp {
         &mut self,
         query: String,
         view: search::View,
-        result: Result<HashSet<String>, String>,
+        result: SearchResult,
         cx: &mut Context<Self>,
     ) {
         // Ignore a search that was replaced while it ran.
@@ -741,12 +755,21 @@ impl AuroraApp {
         self.search_interrupt = None;
         self.search_task = None;
         match result {
-            Ok(ids) => {
+            Ok((ids, sound)) => {
+                if let Some(sound) = sound {
+                    for album in self
+                        .library
+                        .iter_mut()
+                        .flat_map(|artist| artist.albums.iter_mut())
+                    {
+                        album.sound = sound.get(&album.id).copied();
+                    }
+                }
                 self.search_state = SearchState::Idle;
                 self.search = Some(query);
                 self.sort = view.sort;
                 self.group = view.group;
-                self.show_matches(Some(&ids), cx);
+                self.show_matches(ids.as_ref(), cx);
             }
             Err(error) => self.search_state = SearchState::Failed(error),
         }

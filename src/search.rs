@@ -3,7 +3,8 @@
 //! Ported from Aurora (`src-tauri/src/catalog.rs`) so the same queries give
 //! the same albums. `docs/search.md` in Aurora describes the language. Aurora NG
 //! reads the catalog only, so Aurora's pending edits and audio analysis
-//! (`sonic:`) are not part of it.
+//! (`sonic:`) are not part of it. `sound:` reads Aurora's sound descriptors
+//! (see `sound.rs`).
 
 use rusqlite::{Connection, params_from_iter, types::Value};
 use std::collections::HashSet;
@@ -70,6 +71,7 @@ enum Field {
     Love,
     Single,
     Sonic,
+    Sound,
     Extended(Extended),
 }
 
@@ -112,6 +114,7 @@ impl Field {
             "love" => Self::Love,
             "single" | "singles" => Self::Single,
             "sonic" => Self::Sonic,
+            "sound" => Self::Sound,
             _ => return None,
         })
     }
@@ -149,6 +152,8 @@ enum Match {
         to: Option<f64>,
         present: Option<bool>,
     },
+    /// A sound descriptor's label index.
+    Sound(u8),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -575,6 +580,7 @@ pub fn parse(input: &str) -> Result<Search, String> {
                                 .to_owned(),
                         );
                     }
+                    Field::Sound => Match::Sound(crate::sound::parse_label(plain)?),
                     _ => match exact {
                         Some(value) => Match::Exact(value),
                         None => Match::Prefix(prefix_query(value, field.column(), &mut terms)?),
@@ -664,6 +670,7 @@ pub enum GroupField {
     Decade,
     Love,
     AlbumRating,
+    Sound,
 }
 
 impl GroupField {
@@ -676,7 +683,7 @@ impl GroupField {
     fn is_text(self) -> bool {
         matches!(
             self,
-            Self::Genre | Self::AlbumArtist | Self::Publisher | Self::Country
+            Self::Genre | Self::AlbumArtist | Self::Publisher | Self::Country | Self::Sound
         )
     }
 }
@@ -697,7 +704,7 @@ pub struct View {
 }
 
 const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az or sort:aartist za.";
-const GROUP_HELP: &str = "Use group:genre, group:aartist, group:publisher, group:country, group:year, group:decade, group:love or group:ar.";
+const GROUP_HELP: &str = "Use group:genre, group:aartist, group:publisher, group:country, group:year, group:decade, group:love, group:ar or group:sound.";
 
 fn parse_sort(value: &str, descending: bool) -> Result<Sort, String> {
     Ok(match value {
@@ -723,6 +730,7 @@ fn group_field(name: &str) -> Option<GroupField> {
         "decade" => GroupField::Decade,
         "love" => GroupField::Love,
         "ar" => GroupField::AlbumRating,
+        "sound" => GroupField::Sound,
         _ => return None,
     })
 }
@@ -948,6 +956,10 @@ fn group_key(
             };
             (GroupKey::Number(half_stars), label)
         }),
+        GroupField::Sound => album
+            .sound
+            .and_then(crate::sound::label_name)
+            .map(|name| (GroupKey::Text(name.to_lowercase()), name.to_owned())),
     }
 }
 
@@ -960,6 +972,7 @@ fn missing_label(field: GroupField) -> &'static str {
         GroupField::Year | GroupField::Decade => "No year",
         GroupField::Love => "No loved tracks",
         GroupField::AlbumRating => "Not rated",
+        GroupField::Sound => "No sound descriptor",
     }
 }
 
@@ -1151,11 +1164,19 @@ fn track_predicate(
 fn album_predicate(
     alias: &str,
     matcher: &Match,
-    singles: bool,
+    tables: Tables,
     params: &mut Vec<Value>,
 ) -> Option<String> {
     let count = |n: u32| Value::Integer(i64::from(n));
     match matcher {
+        // Without Aurora's descriptors no album has one.
+        Match::Sound(_) if !tables.sound => Some("0".to_owned()),
+        Match::Sound(label) => {
+            params.push(Value::Integer(1 << label));
+            Some(format!(
+                "(COALESCE((SELECT sound_album.mask FROM sound.sound_albums AS sound_album WHERE sound_album.album_id = {alias}.id), 0) & ?) != 0"
+            ))
+        }
         // Stored as a fraction, 0–1.
         Match::Completeness { from, to } => Some(range_sql(
             &format!("{alias}.rating_completeness"),
@@ -1173,7 +1194,7 @@ fn album_predicate(
         )),
         Match::Singles { from, to } => {
             // Catalogs from before Music Library knew singles have none.
-            let is_single = if singles {
+            let is_single = if tables.singles {
                 "EXISTS (SELECT 1 FROM track_singles AS single WHERE single.confidence = 'confirmed' \
                  AND single.artist_key = lower(trim(single_track.album_artist_display)) \
                  AND single.track_key = lower(trim(single_track.title)))"
@@ -1266,12 +1287,21 @@ fn extended_predicate(alias: &str, matcher: &Match, params: &mut Vec<Value>) -> 
     })
 }
 
+/// Which optional tables the connection has.
+#[derive(Clone, Copy)]
+struct Tables {
+    /// Music Library's official singles.
+    singles: bool,
+    /// Aurora's sound descriptors, attached as `sound`.
+    sound: bool,
+}
+
 /// Appends ` AND (…)` for every group, testing albums aliased `a`.
 fn push_album_predicates(
     sql: &mut String,
     params: &mut Vec<Value>,
     search: &Search,
-    singles: bool,
+    tables: Tables,
 ) {
     for group in &search.groups {
         let mut alternatives = Vec::new();
@@ -1333,7 +1363,7 @@ fn push_album_predicates(
 
         alternatives.extend(
             group.alternatives.iter().filter_map(|alternative| {
-                album_predicate("a", &alternative.matcher, singles, params)
+                album_predicate("a", &alternative.matcher, tables, params)
             }),
         );
         alternatives.extend(
@@ -1362,9 +1392,13 @@ pub fn album_ids(connection: &Connection, search: &Search) -> Result<HashSet<Str
             |row| row.get(0),
         )
         .map_err(|error| format!("Could not search: {error}"))?;
+    let tables = Tables {
+        singles,
+        sound: crate::sound::attached(connection)?,
+    };
     let mut sql = String::from("SELECT a.id FROM albums AS a WHERE 1 = 1");
     let mut params = Vec::new();
-    push_album_predicates(&mut sql, &mut params, search, singles);
+    push_album_predicates(&mut sql, &mut params, search, tables);
     let mut statement = connection
         .prepare(&sql)
         .map_err(|error| format!("Could not search: {error}"))?;
@@ -1486,6 +1520,10 @@ mod tests {
 
         assert!(split_view("group:").is_err());
         assert!(split_view("group:mood").is_err());
+        assert_eq!(
+            split("group:sound za").1.group,
+            group(GroupField::Sound, true)
+        );
         assert!(split_view("group:genre..").is_err());
         assert!(split_view("group:genre group:year").is_err());
     }
@@ -1506,6 +1544,7 @@ mod tests {
             loved_tracks: None,
             folder: None,
             cover: None,
+            sound: None,
             charts: Vec::new(),
         };
         let artist = |name: &str, albums: Vec<Album>| Artist {
@@ -1561,6 +1600,7 @@ mod tests {
                 loved_tracks: loved,
                 folder: None,
                 cover: None,
+                sound: None,
                 charts: Vec::new(),
             };
         let artist = |name: &str, country: Option<&str>, albums: Vec<Album>| Artist {
@@ -1637,6 +1677,24 @@ mod tests {
                 ]
             )
         );
+        assert_eq!(
+            grouped(Vec::new(), GroupField::Sound, false).1,
+            [group("No sound descriptor", 0, 4)]
+        );
+        let mut described = artists.clone();
+        described[0].albums[0].sound = Some(5);
+        described[1].albums[0].sound = Some(1);
+        let (order, groups) = group_wall(
+            &described,
+            Vec::new(),
+            WallGrouping {
+                field: GroupField::Sound,
+                descending: false,
+            },
+        );
+        assert_eq!(order, [2, 0, 1, 3]);
+        let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();
+        assert_eq!(labels, ["Choir", "Synth", "No sound descriptor"]);
         // Half stars: 80 is four, 84 rounds to four, 90 is four and a half.
         assert_eq!(
             grouped(Vec::new(), GroupField::AlbumRating, true),
@@ -1715,6 +1773,54 @@ mod tests {
                 .unwrap();
         }
         connection
+    }
+
+    #[test]
+    fn finds_albums_by_their_sound() {
+        use crate::sound::tests::{MODEL_FOR_TESTS, write_cache};
+        let connection = catalog();
+        // Without Aurora's descriptors, sound: finds nothing; unknown sounds fail.
+        assert!(ids(&connection, "sound:synth").is_empty());
+        assert_eq!(ids(&connection, "NOT sound:synth").len(), 8);
+        assert!(
+            parse("sound:kazoo")
+                .unwrap_err()
+                .starts_with("Unknown sound \"kazoo\"")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sound.sqlite3");
+        // Orchestral is bit 0, choir 1, synth 5.
+        write_cache(
+            &path,
+            MODEL_FOR_TESTS,
+            &[
+                ("vangelis", 1 << 5, Some(5)),
+                ("blade", (1 << 5) | 1, Some(5)),
+                ("williams", 0b11, Some(0)),
+                ("zimmer", 0, None),
+            ],
+        );
+        assert!(crate::sound::attach(&connection, &path));
+        assert_eq!(ids(&connection, "sound:synth"), ["blade", "vangelis"]);
+        assert_eq!(
+            ids(&connection, "genre:scores AND sound:synthesizer"),
+            ["vangelis"]
+        );
+        assert_eq!(
+            ids(&connection, "sound:choral OR synth"),
+            ["blade", "vangelis", "williams"]
+        );
+        assert_eq!(
+            ids(&connection, "sound:orchestral NOT sound:choir"),
+            ["blade"]
+        );
+        assert_eq!(
+            crate::sound::album_tops(&connection)
+                .unwrap()
+                .get("williams"),
+            Some(&0)
+        );
     }
 
     #[test]
