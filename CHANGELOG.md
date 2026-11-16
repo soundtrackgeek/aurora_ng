@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.20.0] - 2026-11-16
+
+### Added
+
+- A "back to top" button on the cover wall: once you scroll down, a round arrow shows in the bottom right corner, and clicking it goes back to the first row. **Home** does the same. Open album details stay open.
+
 ## [0.19.0] - 2026-11-14
 
 ### Added

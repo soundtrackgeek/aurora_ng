@@ -41,6 +41,7 @@ impl AssetSource for Assets {
             "icons/heart.svg" => include_bytes!("../assets/icons/heart.svg"),
             "icons/heart-outline.svg" => include_bytes!("../assets/icons/heart-outline.svg"),
             "icons/disc.svg" => include_bytes!("../assets/icons/disc.svg"),
+            "icons/to-top.svg" => include_bytes!("../assets/icons/to-top.svg"),
             _ => match path
                 .strip_prefix("flags/")
                 .and_then(|file| file.strip_suffix(".svg"))

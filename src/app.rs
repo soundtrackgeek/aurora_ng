@@ -1150,6 +1150,21 @@ impl AuroraApp {
         });
     }
 
+    /// Whether the wall has been scrolled down from its very top.
+    fn wall_scrolled(&self) -> bool {
+        let top = self.wall_list.logical_scroll_top();
+        top.item_ix > 0 || top.offset_in_item > px(0.)
+    }
+
+    /// Back to the first row of the wall, keeping any open details open.
+    fn scroll_wall_to_top(&mut self, cx: &mut Context<Self>) {
+        self.wall_list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
     /// Opens the details for wall position `ix` under its row, pushing the
     /// rows below down.
     fn open_details(&mut self, ix: usize) {
@@ -1650,6 +1665,11 @@ impl AuroraApp {
         if keystroke.key == "escape" && self.open_album.is_some() {
             self.close_details();
             cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if keystroke.key == "home" && self.cover_wall {
+            self.scroll_wall_to_top(cx);
             cx.stop_propagation();
             return;
         }
@@ -2415,7 +2435,52 @@ impl AuroraApp {
                         )),
                 )
             })
-            .child(div().flex_1().min_h_0().child(wall))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(wall)
+                    .when(self.wall_scrolled(), |area| {
+                        area.child(self.render_to_top(cx))
+                    }),
+            )
+    }
+
+    /// A round button in the wall's bottom right corner, shown once it has
+    /// been scrolled, that goes back to the first row. Home does the same.
+    fn render_to_top(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = px(40.);
+        div()
+            .id("to-top")
+            .absolute()
+            .right(px(20.))
+            .bottom(px(20.))
+            .size(size)
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .bg(rgb(color::PANEL))
+            .border_1()
+            .border_color(rgb(color::BORDER))
+            .shadow_md()
+            .group("to-top")
+            .hover(|button| button.bg(rgb(color::HOVER)))
+            // Clicks must not reach the cover underneath.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.scroll_wall_to_top(cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                svg()
+                    .path("icons/to-top.svg")
+                    .size(px(18.))
+                    .text_color(rgb(color::ACCENT))
+                    .group_hover("to-top", |icon| icon.text_color(rgb(color::ACCENT_HOVER))),
+            )
     }
 
     /// The name of a `group:` over its covers, with how many albums it has.
