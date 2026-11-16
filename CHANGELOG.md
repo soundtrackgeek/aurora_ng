@@ -2,6 +2,13 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.22.0] - 2026-11-16
+
+### Added
+
+- `vibe:` in the search finds albums that sound like a description in your own words, like `vibe:"dark ambient drone" AND year:1990..1999 AND cr:..50`. It keeps the best-fitting 2% of albums and combines with every other field. The album sounds come from Aurora 0.66.0 or newer; a new description goes to Music Library's CLAP worker (Music Library 0.216.0 or newer).
+- `sort:vibe` puts the best fit to the query's first `vibe:` description first on the cover wall.
+
 ## [0.21.0] - 2026-11-16
 
 ### Added

@@ -72,6 +72,7 @@ enum Field {
     Single,
     Sonic,
     Sound,
+    Vibe,
     Extended(Extended),
 }
 
@@ -115,6 +116,7 @@ impl Field {
             "single" | "singles" => Self::Single,
             "sonic" => Self::Sonic,
             "sound" => Self::Sound,
+            "vibe" => Self::Vibe,
             _ => return None,
         })
     }
@@ -154,6 +156,8 @@ enum Match {
     },
     /// A sound descriptor's label index.
     Sound(u8),
+    /// A normalized description; the best-fitting 2% of albums.
+    Vibe(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +182,19 @@ pub struct Search {
 impl Search {
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty()
+    }
+
+    /// Every `vibe:` description, in order; `sort:vibe` uses the first.
+    pub fn vibes(&self) -> Vec<&str> {
+        let mut vibes = Vec::new();
+        for alternative in self.groups.iter().flat_map(|group| &group.alternatives) {
+            if let Match::Vibe(text) = &alternative.matcher
+                && !vibes.contains(&text.as_str())
+            {
+                vibes.push(text.as_str());
+            }
+        }
+        vibes
     }
 }
 
@@ -581,6 +598,7 @@ pub fn parse(input: &str) -> Result<Search, String> {
                         );
                     }
                     Field::Sound => Match::Sound(crate::sound::parse_label(plain)?),
+                    Field::Vibe => Match::Vibe(crate::vibe::normalize(plain)?),
                     _ => match exact {
                         Some(value) => Match::Exact(value),
                         None => Match::Prefix(prefix_query(value, field.column(), &mut terms)?),
@@ -657,6 +675,8 @@ pub enum Sort {
     AlbumArtist {
         descending: bool,
     },
+    /// Best fit to the search's first `vibe:` description first.
+    Vibe,
 }
 
 /// What `group:` puts the cover wall's albums together by.
@@ -703,12 +723,13 @@ pub struct View {
     pub group: Option<WallGrouping>,
 }
 
-const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az or sort:aartist za.";
+const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az, sort:aartist za or sort:vibe.";
 const GROUP_HELP: &str = "Use group:genre, group:aartist, group:publisher, group:country, group:year, group:decade, group:love, group:ar or group:sound.";
 
 fn parse_sort(value: &str, descending: bool) -> Result<Sort, String> {
     Ok(match value {
         "random" => Sort::Random,
+        "vibe" => Sort::Vibe,
         "year.." => Sort::YearAscending,
         "..year" => Sort::YearDescending,
         "az" => Sort::Album { descending: false },
@@ -878,6 +899,8 @@ pub fn wall_order(artists: &[crate::library::Artist], sort: Sort, seed: u64) -> 
         Sort::AlbumArtist { descending: true } => {
             order.sort_by(|&a, &b| albums[b].0.cmp(albums[a].0));
         }
+        // Best fit first; albums without a score last.
+        Sort::Vibe => order.sort_by(|&a, &b| albums[b].1.vibe.cmp(&albums[a].1.vibe)),
     }
     order
 }
@@ -1177,6 +1200,11 @@ fn album_predicate(
                 "(COALESCE((SELECT sound_album.mask FROM sound.sound_albums AS sound_album WHERE sound_album.album_id = {alias}.id), 0) & ?) != 0"
             ))
         }
+        // Scored before the query runs (`album_ids`).
+        Match::Vibe(text) => Some(format!(
+            "{} IS NOT NULL",
+            crate::vibe::album_sql(text, &format!("{alias}.id"))
+        )),
         // Stored as a fraction, 0–1.
         Match::Completeness { from, to } => Some(range_sql(
             &format!("{alias}.rating_completeness"),
@@ -1396,6 +1424,13 @@ pub fn album_ids(connection: &Connection, search: &Search) -> Result<HashSet<Str
         singles,
         sound: crate::sound::attached(connection)?,
     };
+    // Score each description once, before SQLite asks album by album.
+    let vibes = search
+        .vibes()
+        .into_iter()
+        .map(|text| Ok((text.to_owned(), crate::vibe::scores(connection, text)?)))
+        .collect::<Result<_, String>>()?;
+    crate::vibe::register(connection, vibes)?;
     let mut sql = String::from("SELECT a.id FROM albums AS a WHERE 1 = 1");
     let mut params = Vec::new();
     push_album_predicates(&mut sql, &mut params, search, tables);
@@ -1545,6 +1580,7 @@ mod tests {
             folder: None,
             cover: None,
             sound: None,
+            vibe: None,
             charts: Vec::new(),
         };
         let artist = |name: &str, albums: Vec<Album>| Artist {
@@ -1572,6 +1608,11 @@ mod tests {
         assert_eq!(order(Sort::Album { descending: true }), [0, 3, 2, 1]);
         assert_eq!(order(Sort::AlbumArtist { descending: false }), [0, 1, 2, 3]);
         assert_eq!(order(Sort::AlbumArtist { descending: true }), [2, 3, 0, 1]);
+        // sort:vibe: the best fit first, albums without a score last.
+        let mut scored = artists.clone();
+        scored[1].albums[0].vibe = Some(900_000);
+        scored[0].albums[0].vibe = Some(500_000);
+        assert_eq!(wall_order(&scored, Sort::Vibe, 7), [2, 0, 1, 3]);
 
         let mut shuffled = order(Sort::Random);
         assert_eq!(
@@ -1601,6 +1642,7 @@ mod tests {
                 folder: None,
                 cover: None,
                 sound: None,
+                vibe: None,
                 charts: Vec::new(),
             };
         let artist = |name: &str, country: Option<&str>, albums: Vec<Album>| Artist {
@@ -1824,6 +1866,49 @@ mod tests {
     }
 
     #[test]
+    fn finds_albums_by_their_vibe() {
+        use crate::sound::tests::{MODEL_FOR_TESTS, write_cache};
+        // Without Aurora 0.66.0's album sounds, vibe: explains what it needs.
+        let error = album_ids(&catalog(), &parse("vibe:\"ng test drone\"").unwrap()).unwrap_err();
+        assert!(error.starts_with("vibe: needs Aurora 0.66.0"), "{error}");
+        assert!(parse("vibe:\"   \"").is_err());
+
+        let connection = catalog();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sound.sqlite3");
+        write_cache(&path, MODEL_FOR_TESTS, &[]);
+        // A hundred albums, so the best 2% is two: blade, then williams.
+        let mut albums: Vec<String> = (0..98).map(|index| format!("other{index}")).collect();
+        albums.extend(["williams".to_owned(), "blade".to_owned()]);
+        let albums: Vec<&str> = albums.iter().map(String::as_str).collect();
+        crate::vibe::tests::write_vectors(&path, "ng test drone", &albums);
+        assert!(crate::sound::attach(&connection, &path));
+
+        assert_eq!(
+            ids(&connection, "vibe:\"NG  test Drone\""),
+            ["blade", "williams"]
+        );
+        assert_eq!(
+            ids(&connection, "vibe:\"ng test drone\" AND year:..1990"),
+            ["blade"]
+        );
+        assert_eq!(ids(&connection, "NOT vibe:\"ng test drone\"").len(), 6);
+        assert_eq!(
+            ids(
+                &connection,
+                "vibe:\"ng test drone\" OR aartist:\"bon jovi\""
+            ),
+            ["bj", "blade", "williams"]
+        );
+        let scores = crate::vibe::scores(&connection, "ng test drone").unwrap();
+        assert!(scores["blade"] > scores["williams"]);
+
+        let (rest, view) = split_view("vibe:\"ng test drone\" sort:vibe").unwrap();
+        assert_eq!(view.sort, Some(Sort::Vibe));
+        assert_eq!(parse(&rest).unwrap().vibes(), ["ng test drone"]);
+    }
+
+    #[test]
     fn exact_album_artist_skips_longer_names() {
         let connection = catalog();
         assert_eq!(ids(&connection, "aartist:\"bon jovi\""), ["bj"]);
@@ -1940,6 +2025,8 @@ mod tests {
             "country:norway AND year:1990..",
             "single:3..",
             "bb:..5 AND uk:yes",
+            "vibe:\"dark ambient drone\" AND year:1990..1999 AND cr:..50",
+            "vibe:\"heroic orchestral fanfare\" AND genre:scores",
         ] {
             let started = std::time::Instant::now();
             let found = catalog.search_album_ids(&parse(query).unwrap()).unwrap();

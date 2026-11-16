@@ -33,6 +33,9 @@ pub struct Album {
     /// The album's most common sound descriptor, from Aurora; filled in by a
     /// `group:sound` search.
     pub sound: Option<u8>,
+    /// How well the album fits the search's `vibe:`; filled in by a
+    /// `sort:vibe` search.
+    pub vibe: Option<i64>,
 }
 
 /// The charts Music Library matches the library against.
@@ -240,6 +243,11 @@ impl Catalog {
         crate::search::album_ids(&self.connection, search)
     }
 
+    /// The best-fitting albums for a `vibe:` description, for `sort:vibe`.
+    pub fn vibe_scores(&self, text: &str) -> Result<crate::vibe::Scores, String> {
+        crate::vibe::scores(&self.connection, text)
+    }
+
     /// Every album's most common sound descriptor, for `group:sound`.
     pub fn sound_tops(&self) -> Result<std::collections::HashMap<String, u8>, String> {
         crate::sound::album_tops(&self.connection)
@@ -350,6 +358,7 @@ impl Catalog {
                 folder: non_empty(folder),
                 cover: None,
                 sound: None,
+                vibe: None,
                 charts,
             });
         }

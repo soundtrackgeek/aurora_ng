@@ -130,7 +130,15 @@ enum UpdateState {
 
 /// The albums a search found (`None` for every album), and every album's
 /// sound descriptor when it groups by sound.
-type SearchResult = Result<(Option<HashSet<String>>, Option<HashMap<String, u8>>), String>;
+/// The matching album ids, `group:sound`'s descriptors and `sort:vibe`'s scores.
+type SearchResult = Result<
+    (
+        Option<HashSet<String>>,
+        Option<HashMap<String, u8>>,
+        Option<crate::vibe::Scores>,
+    ),
+    String,
+>;
 
 enum SearchState {
     Idle,
@@ -705,6 +713,20 @@ impl AuroraApp {
         let wants_sound = view
             .group
             .is_some_and(|group| group.field == search::GroupField::Sound);
+        // `sort:vibe` ranks by the search's first `vibe:` description.
+        let vibe = match view.sort {
+            Some(search::Sort::Vibe) => match parsed.vibes().first() {
+                Some(text) => Some((*text).to_owned()),
+                None => {
+                    self.search_state = SearchState::Failed(
+                        "sort:vibe orders by a vibe: description, like vibe:\"dark ambient\" sort:vibe."
+                            .to_owned(),
+                    );
+                    return true;
+                }
+            },
+            _ => None,
+        };
         if parsed.is_empty() && !wants_sound {
             // Nothing to filter, though there may be a sort or group.
             self.search_state = SearchState::Idle;
@@ -731,7 +753,8 @@ impl AuroraApp {
                 Some(catalog.search_album_ids(&parsed)?)
             };
             let sound = wants_sound.then(|| catalog.sound_tops()).transpose()?;
-            Ok((ids, sound))
+            let vibe = vibe.map(|text| catalog.vibe_scores(&text)).transpose()?;
+            Ok((ids, sound, vibe))
         });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -755,14 +778,17 @@ impl AuroraApp {
         self.search_interrupt = None;
         self.search_task = None;
         match result {
-            Ok((ids, sound)) => {
-                if let Some(sound) = sound {
-                    for album in self
-                        .library
-                        .iter_mut()
-                        .flat_map(|artist| artist.albums.iter_mut())
-                    {
+            Ok((ids, sound, vibe)) => {
+                for album in self
+                    .library
+                    .iter_mut()
+                    .flat_map(|artist| artist.albums.iter_mut())
+                {
+                    if let Some(sound) = &sound {
                         album.sound = sound.get(&album.id).copied();
+                    }
+                    if let Some(vibe) = &vibe {
+                        album.vibe = vibe.get(&album.id).copied();
                     }
                 }
                 self.search_state = SearchState::Idle;

@@ -18,6 +18,7 @@ mod shortcuts;
 mod sound;
 mod text_input;
 mod update;
+mod vibe;
 mod waveform;
 
 use gpui::{
