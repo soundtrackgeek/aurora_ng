@@ -53,6 +53,25 @@ enum Extended {
     Vg,
     Ti,
     Nt,
+    /// `sbb:`, `suk:`, `sti:` and `snt:`: albums with a track that charted as
+    /// a single in that range.
+    SingleBillboard,
+    SingleUk,
+    SingleTi,
+    SingleNt,
+}
+
+impl Extended {
+    /// The tracks column holding a singles chart's rank.
+    fn single_column(self) -> Option<&'static str> {
+        match self {
+            Self::SingleBillboard => Some("billboard_single_rank"),
+            Self::SingleUk => Some("official_uk_rank"),
+            Self::SingleTi => Some("ti_i_skuddet_rank"),
+            Self::SingleNt => Some("norsktoppen_rank"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,6 +121,10 @@ impl Field {
             "vg" => Self::Extended(Extended::Vg),
             "ti" => Self::Extended(Extended::Ti),
             "nt" => Self::Extended(Extended::Nt),
+            "sbb" => Self::Extended(Extended::SingleBillboard),
+            "suk" => Self::Extended(Extended::SingleUk),
+            "sti" => Self::Extended(Extended::SingleTi),
+            "snt" => Self::Extended(Extended::SingleNt),
             "artist" => Self::Artist,
             "aartist" => Self::AlbumArtist,
             "album" => Self::Album,
@@ -292,7 +315,8 @@ fn split_field(value: &str) -> Option<(Field, &str)> {
 
 fn parse_extended(field: Extended, value: &str) -> Result<Match, String> {
     use Extended::*;
-    if matches!(field, Dissolved | Dead | Billboard | Uk | Vg | Ti | Nt)
+    if (matches!(field, Dissolved | Dead | Billboard | Uk | Vg | Ti | Nt)
+        || field.single_column().is_some())
         && matches!(value.to_ascii_lowercase().as_str(), "yes" | "no")
     {
         return Ok(Match::Extended {
@@ -1287,6 +1311,26 @@ fn extended_predicate(alias: &str, matcher: &Match, params: &mut Vec<Value>) -> 
             "EXISTS (SELECT 1 FROM musicbrainz_artist_infos AS i WHERE i.local_artist_key = {key} AND i.artist_type = '{kind}' COLLATE NOCASE AND {condition})"
         ));
     }
+    if let Some(rank) = field.single_column() {
+        // A track of the album charted as a single in the range; `no` means
+        // none of its tracks charted at all.
+        let column = format!("chart_track.{rank}");
+        let condition = match present {
+            Some(_) => format!("COALESCE({column}, 0) > 0"),
+            None => {
+                let range = range_sql(&column, *from, *to, real, params);
+                format!("COALESCE(({column} > 0 AND {range}), 0)")
+            }
+        };
+        let exists = format!(
+            "EXISTS (SELECT 1 FROM tracks AS chart_track WHERE chart_track.album_id = {alias}.id AND {condition})"
+        );
+        return Some(if *present == Some(false) {
+            format!("NOT {exists}")
+        } else {
+            exists
+        });
+    }
     // Songs-only charts have no album ranks.
     if matches!(field, Ti | Nt) {
         return Some("0".to_owned());
@@ -1991,6 +2035,32 @@ mod tests {
                 to: None
             }
         );
+    }
+
+    #[test]
+    fn singles_charts_find_albums_by_their_tracks() {
+        let connection = catalog();
+        connection
+            .execute_batch(
+                "ALTER TABLE tracks ADD COLUMN billboard_single_rank INTEGER;
+                 ALTER TABLE tracks ADD COLUMN official_uk_rank INTEGER;
+                 ALTER TABLE tracks ADD COLUMN ti_i_skuddet_rank INTEGER;
+                 ALTER TABLE tracks ADD COLUMN norsktoppen_rank INTEGER;
+                 UPDATE tracks SET ti_i_skuddet_rank = 7, billboard_single_rank = 3 WHERE album_id = 'bj';
+                 UPDATE tracks SET ti_i_skuddet_rank = 12, norsktoppen_rank = 0 WHERE album_id = 'synth';",
+            )
+            .unwrap();
+        assert_eq!(ids(&connection, "sti:5..10"), ["bj"]);
+        assert_eq!(ids(&connection, "year:1986 AND sti:5..10"), ["bj"]);
+        assert!(ids(&connection, "year:1984 AND sti:5..10").is_empty());
+        assert_eq!(ids(&connection, "sti:yes"), ["bj", "synth"]);
+        assert_eq!(ids(&connection, "sti:11.."), ["synth"]);
+        assert_eq!(ids(&connection, "sbb:..5"), ["bj"]);
+        assert!(ids(&connection, "snt:yes").is_empty());
+        assert!(ids(&connection, "suk:1..40").is_empty());
+        assert_eq!(ids(&connection, "sti:no").len(), 6);
+        assert_eq!(ids(&connection, "snt:no").len(), 8);
+        assert!(parse("sti:0..5").is_err());
     }
 
     #[test]

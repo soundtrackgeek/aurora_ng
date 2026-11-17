@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.24.0] - 2026-11-17
+
+### Added
+
+- `sbb:`, `suk:`, `sti:` and `snt:` in the search find albums by their singles, as in Aurora 0.72.0: an album matches when one of its tracks charted as a single on Billboard, the Official UK chart, Ti i skuddet or Norsktoppen in the range. `year:1990 AND sti:5..10` finds 1990 albums with a track that peaked between 5th and 10th place on Ti i skuddet. `yes` finds albums with any charting single, `no` albums with none.
+
 ## [0.23.0] - 2026-11-17
 
 ### Added
