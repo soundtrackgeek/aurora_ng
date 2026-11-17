@@ -27,6 +27,40 @@ pub struct Settings {
     /// The draw `sort:random` showed, so it comes back the same.
     pub shuffle_seed: Option<u64>,
     pub window: Option<SavedWindow>,
+    /// What colours the waveform in the seek bar.
+    pub seek_bar_colour: SeekBarColour,
+}
+
+/// What the seek bar's waveform is coloured by, from Music Library's
+/// per-second timeline. Without a timeline it is always plain.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SeekBarColour {
+    /// Blue where the sound is dull or dark, gold where it is bright.
+    #[default]
+    Brightness,
+    /// Orange where it is close to mono, cyan where it is wide.
+    Width,
+    /// The gradient from before 0.23.0.
+    Plain,
+}
+
+impl SeekBarColour {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Brightness => Self::Width,
+            Self::Width => Self::Plain,
+            Self::Plain => Self::Brightness,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Brightness => "Brightness",
+            Self::Width => "Stereo width",
+            Self::Plain => "Plain",
+        }
+    }
 }
 
 impl Default for Settings {
@@ -40,6 +74,7 @@ impl Default for Settings {
             search: String::new(),
             shuffle_seed: None,
             window: None,
+            seek_bar_colour: SeekBarColour::default(),
         }
     }
 }
@@ -111,6 +146,7 @@ mod tests {
                 height: 800.,
                 maximized: true,
             }),
+            seek_bar_colour: SeekBarColour::Width,
         };
         let text = serde_json::to_string(&settings).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), settings);
@@ -122,5 +158,14 @@ mod tests {
         assert_eq!(settings.cover_size, 300.);
         assert!(settings.cover_wall);
         assert_eq!(settings.album_id, None);
+        assert_eq!(settings.seek_bar_colour, SeekBarColour::Brightness);
+    }
+
+    #[test]
+    fn seek_bar_colours_cycle() {
+        let colour = SeekBarColour::Brightness;
+        assert_eq!(colour.next(), SeekBarColour::Width);
+        assert_eq!(colour.next().next(), SeekBarColour::Plain);
+        assert_eq!(colour.next().next().next(), colour);
     }
 }

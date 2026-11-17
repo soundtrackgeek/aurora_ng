@@ -16,6 +16,7 @@ mod search;
 mod settings;
 mod shortcuts;
 mod sound;
+mod sound_map;
 mod text_input;
 mod update;
 mod vibe;

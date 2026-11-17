@@ -2,6 +2,14 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.23.0] - 2026-11-17
+
+### Added
+
+- The seek bar's waveform is coloured by sound, as in Aurora 0.71.0: by brightness (blue dull, gold bright, the default) or stereo width (orange narrow, cyan wide), from Music Library's per-second timelines. The button after the total time switches between them and the plain colours, and the choice is saved with the other settings. Tracks without a current timeline keep the plain waveform.
+- Faint ticks on the waveform mark where the sound changes.
+- **Skip intro** jumps past a long quiet opening (at least 30 seconds, 6 dB or more below the track's median level) to where the main part starts, marked with a cyan dot. It uses the same rules as Aurora, so both apps show the same sections and intros.
+
 ## [0.22.0] - 2026-11-16
 
 ### Added

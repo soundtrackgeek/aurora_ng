@@ -9,8 +9,10 @@ use crate::{
     music_library, popularity,
     rating::{self, Change, Love, PendingRating, Stars, Values},
     search,
+    settings::SeekBarColour,
     settings::{self, SavedWindow, Settings},
     shortcuts,
+    sound_map::SoundMap,
     text_input::{InputEvent, TextInput},
     update::{self, Release},
     waveform::Waveform,
@@ -90,6 +92,15 @@ pub(crate) mod color {
     pub const WAVE_PLAYED_END: u32 = 0xc026d3;
     pub const WAVE_START: u32 = 0x4c2d6e;
     pub const WAVE_END: u32 = 0x1e5f5a;
+    /// The coloured seek bar, as in Aurora: dull to bright, narrow to wide,
+    /// and seconds without sound.
+    pub const BRIGHTNESS: [u32; 3] = [0x3b4cc0, 0xc056d6, 0xffd166];
+    pub const WIDTH: [u32; 3] = [0xff8a3d, 0xa855f7, 0x22d3ee];
+    pub const SILENT: u32 = 0x5b6573;
+    /// The section ticks in the seek bar.
+    pub const SECTION: u32 = 0x6b6f86;
+    /// The marker where the main part starts, and the skip button.
+    pub const MAIN_PART: u32 = 0x8fdde8;
 }
 
 /// An item in the cover wall's list: a row of covers (or a `group:`
@@ -307,6 +318,11 @@ pub struct AuroraApp {
     /// been read from the file.
     waveform: Option<(PathBuf, Arc<Waveform>)>,
     _waveform_task: Option<Task<()>>,
+    /// The playing track's brightness, width, sections and main part, from
+    /// Music Library's timeline.
+    sound_map: Option<(PathBuf, Arc<SoundMap>)>,
+    _sound_map_task: Option<Task<()>>,
+    seek_bar_colour: SeekBarColour,
     /// The listening history shared with Aurora and Music Library.
     history: Option<History>,
     /// The listen to the track playing now.
@@ -493,6 +509,9 @@ impl AuroraApp {
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             waveform: None,
             _waveform_task: None,
+            sound_map: None,
+            _sound_map_task: None,
+            seek_bar_colour: settings.seek_bar_colour,
             history: History::open().ok(),
             session: None,
             track_stats: None,
@@ -626,6 +645,7 @@ impl AuroraApp {
             },
             shuffle_seed: Some(self.shuffle_seed),
             window,
+            seek_bar_colour: self.seek_bar_colour,
         }
     }
 
@@ -1559,9 +1579,57 @@ impl AuroraApp {
         cx.notify();
     }
 
+    /// Jumps to `seconds` into the playing track.
+    fn seek_seconds(&mut self, seconds: usize, cx: &mut Context<Self>) {
+        let Ok(audio) = &self.audio else {
+            return;
+        };
+        let position = audio.position();
+        let target = Duration::from_secs(seconds as u64);
+        audio.seek(target);
+        self.after_seek(position, target);
+        cx.notify();
+    }
+
+    /// Reads the playing track's sound map in the background, unless it is
+    /// already there.
+    fn load_sound_map(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.current_track().map(|track| track.path.clone()) else {
+            return;
+        };
+        if self
+            .sound_map
+            .as_ref()
+            .is_some_and(|(shown, _)| *shown == path)
+        {
+            return;
+        }
+        self.sound_map = None;
+        let Ok(catalog) = crate::library::catalog_path() else {
+            return;
+        };
+        let job = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { SoundMap::for_track(&catalog, &path) }
+        });
+        self._sound_map_task = Some(cx.spawn(async move |this, cx| {
+            // A track without a timeline keeps the plain waveform.
+            if let Some(map) = job.await {
+                this.update(cx, |this, cx| {
+                    if this.current_track().is_some_and(|track| track.path == path) {
+                        this.sound_map = Some((path, Arc::new(map)));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        }));
+    }
+
     /// Reads the playing track's waveform in the background, unless it is
     /// already there (the same track again).
     fn load_waveform(&mut self, cx: &mut Context<Self>) {
+        self.load_sound_map(cx);
         let Some(path) = self.current_track().map(|track| track.path.clone()) else {
             return;
         };
@@ -2986,6 +3054,16 @@ impl AuroraApp {
             .as_ref()
             .filter(|(path, _)| track.is_some_and(|track| track.path == *path))
             .map(|(_, waveform)| waveform.clone());
+        let sound_map = self
+            .sound_map
+            .as_ref()
+            .filter(|(path, _)| track.is_some_and(|track| track.path == *path))
+            .map(|(_, map)| map.clone());
+        let colour = self.seek_bar_colour;
+        let skip_intro = sound_map
+            .as_ref()
+            .and_then(|map| map.main_start)
+            .filter(|start| elapsed + 2 < *start as i64);
         let seek_bar = div()
             .id("seek-bar")
             .flex_1()
@@ -3003,7 +3081,13 @@ impl AuroraApp {
                 canvas(
                     move |bounds, _, _| bounds_cell.set(bounds),
                     move |bounds, _, window, _| {
-                        paint_seek_bar(bounds, fraction, waveform.as_deref(), window)
+                        paint_seek_bar(
+                            bounds,
+                            fraction,
+                            waveform.as_deref(),
+                            sound_map.as_deref().map(|map| (map, colour, total)),
+                            window,
+                        )
                     },
                 )
                 .size_full(),
@@ -3061,7 +3145,31 @@ impl AuroraApp {
                             .text_color(rgb(color::MUTED))
                             .child(div().w(px(44.)).flex().justify_end().child(clock(elapsed)))
                             .child(seek_bar)
-                            .child(div().w(px(44.)).child(clock(total))),
+                            .child(div().w(px(44.)).child(clock(total)))
+                            .when_some(skip_intro, |row, start| {
+                                row.child(
+                                    text_button(
+                                        "skip-intro",
+                                        format!("Skip intro · {}", clock(start as i64)),
+                                        false,
+                                    )
+                                    .border_color(rgb(color::MAIN_PART))
+                                    .text_color(rgb(color::MAIN_PART))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            this.seek_seconds(start, cx)
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                text_button("seek-bar-colour", colour.name(), false).on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.seek_bar_colour = this.seek_bar_colour.next();
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
                     ),
             )
             .when(track.is_some() && self.history.is_some(), |bar| {
@@ -3398,6 +3506,8 @@ fn paint_seek_bar(
     bounds: Bounds<Pixels>,
     fraction: f32,
     waveform: Option<&Waveform>,
+    // The sound map, its colour, and the track's length in seconds.
+    map: Option<(&SoundMap, SeekBarColour, i64)>,
     window: &mut Window,
 ) {
     let width = f32::from(bounds.size.width);
@@ -3433,10 +3543,25 @@ fn paint_seek_bar(
         // silence still shows where the track is.
         let bar_height = (level * height).max(1.);
         let along = x / width;
-        let color = if x + BAR_WIDTH / 2. <= played_x {
-            mix(color::WAVE_PLAYED_START, color::WAVE_PLAYED_END, along)
-        } else {
-            mix(color::WAVE_START, color::WAVE_END, along)
+        let played = x + BAR_WIDTH / 2. <= played_x;
+        let lane = map.and_then(|(map, colour, _)| match colour {
+            SeekBarColour::Brightness => Some((&map.brightness, color::BRIGHTNESS)),
+            SeekBarColour::Width => Some((&map.width, color::WIDTH)),
+            SeekBarColour::Plain => None,
+        });
+        let color = match lane.filter(|(values, _)| !values.is_empty()) {
+            Some((values, stops)) => {
+                let bin = ((along * values.len() as f32) as usize).min(values.len() - 1);
+                let full = values[bin].map_or(color::SILENT, |value| ramp(stops, value));
+                // What is still to come is the same colour, dimmed.
+                if played {
+                    full
+                } else {
+                    mix(full, color::PANEL, 0.62)
+                }
+            }
+            None if played => mix(color::WAVE_PLAYED_START, color::WAVE_PLAYED_END, along),
+            None => mix(color::WAVE_START, color::WAVE_END, along),
         };
         window.paint_quad(fill(
             Bounds::new(
@@ -3449,6 +3574,34 @@ fn paint_seek_bar(
             rgb(color),
         ));
     }
+    if let Some((map, _, total)) = map.filter(|(_, _, total)| *total > 0) {
+        // Faint ticks where the sound changes, and a dot where the main
+        // part starts.
+        let at = |second: usize| (second as f32 / total as f32).min(1.) * width;
+        for second in &map.sections {
+            for top in [0., height - 4.] {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + px(at(*second)), bounds.top() + px(top)),
+                        size(px(1.), px(4.)),
+                    ),
+                    rgb(color::SECTION),
+                ));
+            }
+        }
+        if let Some(start) = map.main_start {
+            window.paint_quad(
+                fill(
+                    Bounds::new(
+                        point(bounds.left() + px(at(start) - 3.), bounds.top()),
+                        size(px(6.), px(6.)),
+                    ),
+                    rgb(color::MAIN_PART),
+                )
+                .corner_radii(px(3.)),
+            );
+        }
+    }
     if fraction > 0. {
         window.paint_quad(fill(
             Bounds::new(
@@ -3457,6 +3610,16 @@ fn paint_seek_bar(
             ),
             rgb(color::TEXT),
         ));
+    }
+}
+
+/// The colour `value` (0 to 1) of the way along three colour stops.
+fn ramp(stops: [u32; 3], value: f32) -> u32 {
+    let value = value.clamp(0., 1.);
+    if value <= 0.5 {
+        mix(stops[0], stops[1], value * 2.)
+    } else {
+        mix(stops[1], stops[2], value * 2. - 1.)
     }
 }
 
@@ -3555,6 +3718,14 @@ fn thousands(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ramps_through_three_colours_like_aurora() {
+        assert_eq!(ramp(color::BRIGHTNESS, 0.), 0x3b4cc0);
+        assert_eq!(ramp(color::BRIGHTNESS, 0.5), 0xc056d6);
+        assert_eq!(ramp(color::BRIGHTNESS, 1.), 0xffd166);
+        assert_eq!(ramp(color::WIDTH, 2.), 0x22d3ee);
+    }
 
     #[test]
     fn formats_clock_times() {
