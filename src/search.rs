@@ -53,10 +53,11 @@ enum Extended {
     Vg,
     Ti,
     Nt,
-    /// `sbb:`, `suk:`, `sti:` and `snt:`: albums with a track that charted as
+    /// `sbb:`, `suk:`, `svg:`, `sti:` and `snt:`: albums with a track that charted as
     /// a single in that range.
     SingleBillboard,
     SingleUk,
+    SingleVg,
     SingleTi,
     SingleNt,
 }
@@ -67,6 +68,7 @@ impl Extended {
         match self {
             Self::SingleBillboard => Some("billboard_single_rank"),
             Self::SingleUk => Some("official_uk_rank"),
+            Self::SingleVg => Some("vg_lista_rank"),
             Self::SingleTi => Some("ti_i_skuddet_rank"),
             Self::SingleNt => Some("norsktoppen_rank"),
             _ => None,
@@ -123,6 +125,7 @@ impl Field {
             "nt" => Self::Extended(Extended::Nt),
             "sbb" => Self::Extended(Extended::SingleBillboard),
             "suk" => Self::Extended(Extended::SingleUk),
+            "svg" => Self::Extended(Extended::SingleVg),
             "sti" => Self::Extended(Extended::SingleTi),
             "snt" => Self::Extended(Extended::SingleNt),
             "artist" => Self::Artist,
@@ -2044,10 +2047,13 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE tracks ADD COLUMN billboard_single_rank INTEGER;
                  ALTER TABLE tracks ADD COLUMN official_uk_rank INTEGER;
+                 ALTER TABLE tracks ADD COLUMN vg_lista_rank INTEGER;
                  ALTER TABLE tracks ADD COLUMN ti_i_skuddet_rank INTEGER;
                  ALTER TABLE tracks ADD COLUMN norsktoppen_rank INTEGER;
                  UPDATE tracks SET ti_i_skuddet_rank = 7, billboard_single_rank = 3 WHERE album_id = 'bj';
-                 UPDATE tracks SET ti_i_skuddet_rank = 12, norsktoppen_rank = 0 WHERE album_id = 'synth';",
+                 UPDATE tracks SET ti_i_skuddet_rank = 12, norsktoppen_rank = 0 WHERE album_id = 'synth';
+                 UPDATE tracks SET vg_lista_rank = 4 WHERE album_id = 'blade';
+                 UPDATE albums SET vg_lista_rank = 2 WHERE id = 'vangelis';",
             )
             .unwrap();
         assert_eq!(ids(&connection, "sti:5..10"), ["bj"]);
@@ -2056,6 +2062,11 @@ mod tests {
         assert_eq!(ids(&connection, "sti:yes"), ["bj", "synth"]);
         assert_eq!(ids(&connection, "sti:11.."), ["synth"]);
         assert_eq!(ids(&connection, "sbb:..5"), ["bj"]);
+        assert_eq!(ids(&connection, "svg:yes"), ["blade"]);
+        assert_eq!(ids(&connection, "svg:..5 AND year:1983"), ["blade"]);
+        // vg: still reads the album chart, not the album's singles.
+        assert_eq!(ids(&connection, "vg:yes"), ["vangelis"]);
+        assert_eq!(ids(&connection, "svg:no").len(), 7);
         assert!(ids(&connection, "snt:yes").is_empty());
         assert!(ids(&connection, "suk:1..40").is_empty());
         assert_eq!(ids(&connection, "sti:no").len(), 6);

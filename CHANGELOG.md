@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.25.0] - 2026-11-18
+
+### Added
+
+- `svg:` finds albums with a track that charted as a single on VG-lista in the range, as in Aurora 0.76.0, like `year:1985 AND svg:..10`. `vg:` still searches the album chart.
+
 ## [0.24.0] - 2026-11-17
 
 ### Added
