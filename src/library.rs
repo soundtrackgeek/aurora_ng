@@ -22,6 +22,9 @@ pub struct Album {
     pub rating: Option<i64>,
     /// Music Library's Album Score: an open-ended ranking number, not stars.
     pub score: Option<f64>,
+    /// The album's place by Album Score among its year's albums in the same
+    /// genre pool; see [`assign_ranks`].
+    pub rank: Option<u32>,
     /// How many of the album's tracks are marked Love.
     pub loved_tracks: Option<i64>,
     /// The folder the album's files are in, like `D:\MUSIC\Kittie - Oracle (2001)`.
@@ -354,6 +357,7 @@ impl Catalog {
                 total_seconds,
                 rating,
                 score,
+                rank: None,
                 loved_tracks,
                 folder: non_empty(folder),
                 cover: None,
@@ -364,6 +368,7 @@ impl Catalog {
         }
 
         let mut artists: Vec<Artist> = artists.into_values().collect();
+        assign_ranks(&mut artists);
         for artist in &mut artists {
             artist.albums.sort_by(|a, b| {
                 // Albums without a year go last.
@@ -453,6 +458,55 @@ impl Catalog {
     }
 }
 
+/// Which albums an album is ranked against: scores (the `genre:scores`
+/// genres) only against scores, soundtracks only against soundtracks, and
+/// everything else against everything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RankPool {
+    Scores,
+    Soundtrack,
+    General,
+}
+
+pub fn rank_pool(genre: Option<&str>) -> RankPool {
+    let genre = genre.unwrap_or_default().trim().to_lowercase();
+    if crate::search::SCORE_GENRES.contains(&genre.as_str()) {
+        RankPool::Scores
+    } else if genre == "soundtrack" {
+        RankPool::Soundtrack
+    } else {
+        RankPool::General
+    }
+}
+
+/// Gives every album with an Album Score and a year its Rank: 1 for the
+/// highest Album Score of its year and pool. Only the Album Score counts, not
+/// the rating. Albums with the same score share a rank, and the next one
+/// skips ahead (1, 2, 2, 4).
+pub fn assign_ranks(artists: &mut [Artist]) {
+    let mut pools: std::collections::HashMap<(i64, RankPool), Vec<f64>> =
+        std::collections::HashMap::new();
+    for album in artists.iter().flat_map(|artist| &artist.albums) {
+        if let (Some(year), Some(score)) = (album.year, album.score) {
+            pools
+                .entry((year, rank_pool(album.genre.as_deref())))
+                .or_default()
+                .push(score);
+        }
+    }
+    for scores in pools.values_mut() {
+        scores.sort_by(|a, b| b.total_cmp(a));
+    }
+    for album in artists.iter_mut().flat_map(|artist| &mut artist.albums) {
+        album.rank = match (album.year, album.score) {
+            (Some(year), Some(score)) => pools
+                .get(&(year, rank_pool(album.genre.as_deref())))
+                .map(|scores| scores.partition_point(|&other| other > score + 1e-9) as u32 + 1),
+            _ => None,
+        };
+    }
+}
+
 /// `unicode_lower`, which Music Library defines in its catalog and uses in
 /// artist keys; SQLite's own `lower` only knows ASCII.
 pub fn register_functions(connection: &Connection) -> Result<(), String> {
@@ -479,6 +533,68 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranked(year: Option<i64>, genre: &str, score: Option<f64>, rating: Option<i64>) -> Album {
+        Album {
+            id: format!("{genre}-{score:?}-{rating:?}"),
+            title: String::new(),
+            year,
+            publisher: None,
+            genre: Some(genre.to_owned()),
+            total_tracks: None,
+            total_seconds: None,
+            rating,
+            score,
+            rank: None,
+            loved_tracks: None,
+            folder: None,
+            cover: None,
+            charts: Vec::new(),
+            sound: None,
+            vibe: None,
+        }
+    }
+
+    #[test]
+    fn ranks_by_album_score_within_the_year_and_genre_pool() {
+        let mut artists = vec![Artist {
+            name: "A".to_owned(),
+            sort_key: "a".to_owned(),
+            flag: None,
+            country: None,
+            albums: vec![
+                // A better rating never beats a better Album Score.
+                ranked(Some(2026), "Rock", Some(8.0), Some(100)),
+                ranked(Some(2026), "Rock", Some(9.5), Some(20)),
+                ranked(Some(2026), "Synthpop", Some(9.5), Some(40)),
+                ranked(Some(2025), "Rock", Some(1.0), None),
+                ranked(Some(2026), "TV", Some(600.0), None),
+                ranked(Some(2026), "Video Game", Some(5.0), None),
+                ranked(Some(2026), "Soundtrack", Some(300.0), None),
+                ranked(Some(2026), "Rock", None, None),
+                ranked(None, "Rock", Some(50.0), None),
+            ],
+        }];
+        assign_ranks(&mut artists);
+        let ranks: Vec<_> = artists[0].albums.iter().map(|album| album.rank).collect();
+        assert_eq!(
+            ranks,
+            [
+                Some(3),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(1),
+                None,
+                None
+            ]
+        );
+        assert_eq!(rank_pool(Some(" drama ")), RankPool::Scores);
+        assert_eq!(rank_pool(Some("Soundtrack")), RankPool::Soundtrack);
+        assert_eq!(rank_pool(None), RankPool::General);
+    }
 
     const SCHEMA: &str = "
         CREATE TABLE albums (id TEXT PRIMARY KEY, album TEXT, album_artist_display TEXT,

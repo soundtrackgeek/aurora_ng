@@ -14,7 +14,7 @@ const MAX_ALTERNATIVES: usize = 32;
 pub const MAX_QUERY_CHARS: usize = 256;
 
 /// The canonical genres `genre:scores` stands for.
-const SCORE_GENRES: [&str; 13] = [
+pub const SCORE_GENRES: [&str; 13] = [
     "action",
     "animation",
     "comedy",
@@ -1623,6 +1623,7 @@ mod tests {
             total_seconds: None,
             rating: None,
             score: None,
+            rank: None,
             loved_tracks: None,
             folder: None,
             cover: None,
@@ -1685,6 +1686,7 @@ mod tests {
                 total_seconds: None,
                 rating,
                 score: None,
+                rank: None,
                 loved_tracks: loved,
                 folder: None,
                 cover: None,

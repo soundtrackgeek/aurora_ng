@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.26.0] - 2026-11-22
+
+### Added
+
+- **Rank** after the Album Score, on the cover wall and in the album details, as in Aurora 0.78.0: the album's place by Album Score among the albums of its year, like `Rank: 27`. Only the Album Score counts, not the rating. Scores (the `genre:scores` genres) are ranked only against scores, Soundtrack albums only against soundtracks, and everything else against everything else. It is worked out again when a rating changes an album's Album Score.
+
 ## [0.25.0] - 2026-11-18
 
 ### Added

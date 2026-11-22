@@ -2096,6 +2096,23 @@ impl AuroraApp {
                 album.rating = rating;
                 album.score = score;
             }
+            // A new score can move every album of the year up or down.
+            crate::library::assign_ranks(&mut self.library);
+            let ranks: std::collections::HashMap<&str, Option<u32>> = self
+                .library
+                .iter()
+                .flat_map(|artist| &artist.albums)
+                .map(|album| (album.id.as_str(), album.rank))
+                .collect();
+            for album in self
+                .artists
+                .iter_mut()
+                .flat_map(|artist| &mut artist.albums)
+            {
+                if let Some(&rank) = ranks.get(album.id.as_str()) {
+                    album.rank = rank;
+                }
+            }
         }
     }
 
@@ -2753,11 +2770,13 @@ impl AuroraApp {
         .join(" · ")
     }
 
-    /// "★★★½ 3.60 · Album Score: 3.60".
+    /// "★★★½ 3.60 · Album Score: 3.60 · Rank: 4".
     fn album_rating(&self, album: &Album) -> Div {
         div()
             .flex()
             .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
             .gap_2()
             .text_color(rgb(color::MUTED))
             .child(stars(album.rating, px(13.)))
@@ -2771,6 +2790,13 @@ impl AuroraApp {
                 album
                     .score
                     .map_or_else(|| "—".to_owned(), |score| format!("{score:.2}"))
+            ))
+            .child("·")
+            .child(format!(
+                "Rank: {}",
+                album
+                    .rank
+                    .map_or_else(|| "—".to_owned(), |rank| rank.to_string())
             ))
     }
 
