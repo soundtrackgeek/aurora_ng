@@ -8,6 +8,7 @@ use crate::{
     library::{Album, Artist, Catalog, Track, catalog_path},
     music_library, popularity,
     rating::{self, Change, Love, PendingRating, Stars, Values},
+    rating_log::{self, TrackNames},
     search,
     settings::SeekBarColour,
     settings::{self, SavedWindow, Settings},
@@ -173,6 +174,8 @@ enum RatingJob {
         album_id: String,
         title: String,
         change: Change,
+        /// For the rating log.
+        names: TrackNames,
     },
     /// Have Music Library read an MP3 that was saved.
     Sync { path: PathBuf, album_id: String },
@@ -1832,6 +1835,7 @@ impl AuroraApp {
             album_id: track.album_id.clone(),
             title: track.title.clone(),
             change: Change::Rating(stars),
+            names: self.track_names(track),
         };
         // A newer rating replaces one for the same track still waiting.
         let waiting = self.rating_jobs.iter_mut().find(|waiting| {
@@ -1846,6 +1850,31 @@ impl AuroraApp {
         cx.notify();
     }
 
+    /// The track's album and album artist for the rating log: from the
+    /// shown albums, or the album playing when the track is in the queue.
+    fn track_names(&self, track: &Track) -> TrackNames {
+        let (album, album_artist) = match self.find_album(&track.album_id) {
+            Some((artist, album)) => (
+                Some(self.artists[artist].albums[album].title.clone()),
+                Some(self.artists[artist].name.clone()),
+            ),
+            None if self.queue.iter().any(|queued| queued.path == track.path)
+                && !self.queue_album.is_empty() =>
+            {
+                (Some(self.queue_album.to_string()), None)
+            }
+            None => (None, None),
+        };
+        TrackNames {
+            path: track.path.clone(),
+            album_id: track.album_id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album,
+            album_artist,
+        }
+    }
+
     /// Loves a track, or takes Love away. The heart changes once the MP3 is
     /// saved: each toggle starts from what the file has, so two quick presses
     /// toggle twice.
@@ -1855,6 +1884,7 @@ impl AuroraApp {
             album_id: track.album_id.clone(),
             title: track.title.clone(),
             change: Change::ToggleLove,
+            names: self.track_names(track),
         });
         self.rating_status = None;
         self.run_rating_job(cx);
@@ -1947,7 +1977,19 @@ impl AuroraApp {
             let job = job.clone();
             cx.background_executor().spawn(async move {
                 match job {
-                    RatingJob::Save { path, change, .. } => rating::save(&path, change).map(Some),
+                    RatingJob::Save {
+                        path,
+                        change,
+                        names,
+                        ..
+                    } => rating::save(&path, change).map(|saved| {
+                        // The MP3 has the change either way; a log that can't be
+                        // written only means this change is missing from it.
+                        if let Some(log) = rating_log::default_path() {
+                            let _ = rating_log::append(&log, &names, saved, rating_log::now_ms());
+                        }
+                        Some(saved.after)
+                    }),
                     RatingJob::Sync { path, .. } => music_library::sync_file(&path).map(|()| None),
                 }
             })

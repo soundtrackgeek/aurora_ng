@@ -12,6 +12,7 @@ mod library;
 mod music_library;
 mod popularity;
 mod rating;
+mod rating_log;
 mod search;
 mod settings;
 mod shortcuts;

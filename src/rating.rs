@@ -64,6 +64,25 @@ pub struct Values {
     pub love: Love,
 }
 
+/// What a save found in the MP3 and what it left there; the same when
+/// there was nothing to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Saved {
+    pub before: Values,
+    pub after: Values,
+}
+
+impl Love {
+    /// How the rating log names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "neutral",
+            Self::Loved => "loved",
+            Self::Banned => "banned",
+        }
+    }
+}
+
 /// What a save changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -117,8 +136,9 @@ impl Stars {
 }
 
 /// Makes `change` to the MP3, starting from the values it has now, and
-/// returns the values it has after. Does nothing when nothing would change.
-pub fn save(path: &Path, change: Change) -> Result<Values, String> {
+/// returns the values it had before and has after. Does nothing when
+/// nothing would change.
+pub fn save(path: &Path, change: Change) -> Result<Saved, String> {
     if !path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
@@ -130,7 +150,10 @@ pub fn save(path: &Path, change: Change) -> Result<Values, String> {
     let before = read_values(&tag)?;
     let desired = change.apply(before);
     if desired == before {
-        return Ok(before);
+        return Ok(Saved {
+            before,
+            after: before,
+        });
     }
     let preserved = other_frames(&tag);
     let audio = audio_payload_hash(path)?;
@@ -176,7 +199,10 @@ pub fn save(path: &Path, change: Change) -> Result<Values, String> {
         };
     }
     let _ = fs::remove_file(&backup);
-    Ok(desired)
+    Ok(Saved {
+        before,
+        after: desired,
+    })
 }
 
 #[cfg(test)]
@@ -723,7 +749,7 @@ mod tests {
             });
         });
 
-        let loved = save(&path, Change::ToggleLove).unwrap();
+        let loved = save(&path, Change::ToggleLove).unwrap().after;
         assert_eq!(
             loved,
             Values {
@@ -743,7 +769,10 @@ mod tests {
         assert!(fs::read(&path).unwrap().ends_with(AUDIO));
 
         // A second press reads the saved value and takes Love away again.
-        assert_eq!(save(&path, Change::ToggleLove).unwrap().love, Love::Neutral);
+        assert_eq!(
+            save(&path, Change::ToggleLove).unwrap().after.love,
+            Love::Neutral
+        );
         assert_eq!(
             love_texts(&path),
             [("Other".to_owned(), "keep me".to_owned())]
@@ -762,7 +791,10 @@ mod tests {
             });
         });
         assert_eq!(read_values_from_path(&path).unwrap().love, Love::Banned);
-        assert_eq!(save(&path, Change::ToggleLove).unwrap().love, Love::Loved);
+        assert_eq!(
+            save(&path, Change::ToggleLove).unwrap().after.love,
+            Love::Loved
+        );
         assert_eq!(
             love_texts(&path),
             [("LOVE RATING".to_owned(), "L".to_owned())]
@@ -771,9 +803,15 @@ mod tests {
         let rated = save(&path, Change::Rating(stars(5))).unwrap();
         assert_eq!(
             rated,
-            Values {
-                rating: Some(100),
-                love: Love::Loved
+            Saved {
+                before: Values {
+                    rating: None,
+                    love: Love::Loved
+                },
+                after: Values {
+                    rating: Some(100),
+                    love: Love::Loved
+                }
             }
         );
     }

@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.27.0] - 2026-11-22
+
+### Added
+
+- **Rating log**: every rating and Love change is added to `%LOCALAPPDATA%\aurora_ng\rating-log.sqlite3` (table `rating_changes`) with the time, the track, its album, and the rating and Love before and after, so other programs can see what was rated. Music Library only keeps each album's totals.
+
 ## [0.26.0] - 2026-11-22
 
 ### Added
