@@ -2216,6 +2216,26 @@ impl AuroraApp {
             }))
     }
 
+    /// The heart, which loves the track or takes Love away when clicked.
+    fn love_control(
+        &self,
+        place: &'static str,
+        track: &Track,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let target = track.clone();
+        div()
+            .id(place)
+            .p_1()
+            .cursor_pointer()
+            .child(heart(track.loved, px(14.)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                // The click is for the heart, not for the row under it.
+                cx.stop_propagation();
+                this.toggle_love(&target, cx);
+            }))
+    }
+
     /// What ratings are doing, for the now-playing bar.
     fn rating_status_line(&self) -> Option<(String, u32)> {
         if self.rating_running.is_some() || !self.rating_jobs.is_empty() {
@@ -3006,7 +3026,7 @@ impl AuroraApp {
                             .text_color(rgb(color::MUTED))
                             .child(track.duration_seconds.map(clock).unwrap_or_default()),
                         div().child(self.rating_control("details", track, cx)),
-                        div().child(heart(track.loved, px(14.))),
+                        div().child(self.love_control("details-love", track, cx)),
                     ],
                 )
             })
@@ -3109,7 +3129,7 @@ impl AuroraApp {
                 .gap_2()
                 .min_w_0()
                 .child(self.rating_control("playing", track, cx))
-                .child(heart(track.loved, px(14.)))
+                .child(self.love_control("playing-love", track, cx))
                 .child(
                     div()
                         .flex_none()

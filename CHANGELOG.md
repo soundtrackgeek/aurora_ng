@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.28.0] - 2026-11-23
+
+### Added
+
+- **Clickable hearts**: click the heart next to a track, in the album details or in the now-playing bar, to love it or take Love away again. Until now the heart only showed Love, so Ctrl+Alt+L on the playing track was the only way to change it.
+
 ## [0.27.1] - 2026-11-23
 
 ### Changed
