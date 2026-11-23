@@ -16,14 +16,16 @@ pub struct Album {
     pub publisher: Option<String>,
     pub genre: Option<String>,
     pub total_tracks: Option<i64>,
+    /// How many of the album's tracks have a rating.
+    pub rated_tracks: Option<i64>,
     pub total_seconds: Option<i64>,
     /// 0–100, like track ratings: the explicit album rating, or the mean of
     /// the tracks once every one is rated.
     pub rating: Option<i64>,
     /// Music Library's Album Score: an open-ended ranking number, not stars.
     pub score: Option<f64>,
-    /// The album's place by Album Score among its year's albums in the same
-    /// genre pool; see [`assign_ranks`].
+    /// The album's place by Album Score among its year's fully rated albums
+    /// in the same genre pool; see [`assign_ranks`].
     pub rank: Option<u32>,
     /// How many of the album's tracks are marked Love.
     pub loved_tracks: Option<i64>,
@@ -174,6 +176,7 @@ pub struct Catalog {
     has_origin_names: bool,
     /// Albums count their loved tracks.
     has_loved_tracks: bool,
+    has_rated_tracks: bool,
 }
 
 impl Catalog {
@@ -224,12 +227,14 @@ impl Catalog {
         let has_origin_names =
             has_origins && has_column("musicbrainz_artist_origin_countries", "country_name")?;
         let has_loved_tracks = has_column("albums", "loved_tracks")?;
+        let has_rated_tracks = has_column("albums", "rated_tracks")?;
         Ok(Self {
             connection,
             has_singles,
             has_origins,
             has_origin_names,
             has_loved_tracks,
+            has_rated_tracks,
         })
     }
 
@@ -279,6 +284,7 @@ impl Catalog {
         } else {
             "NULL"
         };
+        let rated = self.rated_tracks_sql();
         let mut statement = self
             .connection
             .prepare(&format!(
@@ -287,7 +293,7 @@ impl Catalog {
                         a.publisher, a.total_tracks, a.total_seconds,
                         a.effective_album_rating, a.album_score, a.canonical_genre,
                         a.billboard_rank, a.official_uk_rank, a.vg_lista_rank, {country},
-                        {loved}
+                        {loved}, {rated}
                  FROM albums a"
             ))
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -309,6 +315,7 @@ impl Catalog {
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
                     row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
                 ))
             })
             .map_err(|error| format!("Could not read albums: {error}"))?;
@@ -331,6 +338,7 @@ impl Catalog {
                 country,
                 country_name,
                 loved_tracks,
+                rated_tracks,
             ) = row.map_err(|error| format!("Could not read an album: {error}"))?;
             let name = non_empty(artist).unwrap_or_else(|| "Unknown Artist".to_owned());
             let sort_key = name.to_lowercase();
@@ -354,6 +362,7 @@ impl Catalog {
                 publisher: non_empty(publisher),
                 genre: non_empty(genre),
                 total_tracks,
+                rated_tracks,
                 total_seconds,
                 rating,
                 score,
@@ -447,14 +456,50 @@ impl Catalog {
 impl Catalog {
     /// An album's rating (0–100) and Album Score, which Music Library works
     /// out again when a track's rating changes.
-    pub fn album_rating(&self, album_id: &str) -> Result<(Option<i64>, Option<f64>), String> {
+    pub fn album_rating(&self, album_id: &str) -> Result<AlbumRating, String> {
         self.connection
             .query_row(
-                "SELECT effective_album_rating, album_score FROM albums WHERE id = ?1",
+                &format!(
+                    "SELECT a.effective_album_rating, a.album_score, a.total_tracks, {}
+                     FROM albums a WHERE a.id = ?1",
+                    self.rated_tracks_sql()
+                ),
                 [album_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok(AlbumRating {
+                        rating: row.get(0)?,
+                        score: row.get(1)?,
+                        total_tracks: row.get(2)?,
+                        rated_tracks: row.get(3)?,
+                    })
+                },
             )
             .map_err(|error| format!("Could not read the album's rating: {error}"))
+    }
+
+    /// Older catalogs have no `rated_tracks`; their albums are never counted
+    /// as fully rated.
+    fn rated_tracks_sql(&self) -> &'static str {
+        if self.has_rated_tracks {
+            "a.rated_tracks"
+        } else {
+            "NULL"
+        }
+    }
+}
+
+/// An album's rating values after a rating change.
+pub struct AlbumRating {
+    pub rating: Option<i64>,
+    pub score: Option<f64>,
+    pub total_tracks: Option<i64>,
+    pub rated_tracks: Option<i64>,
+}
+
+impl Album {
+    /// Whether every track has a rating, which makes its Rank final.
+    pub fn is_fully_rated(&self) -> bool {
+        matches!((self.total_tracks, self.rated_tracks), (Some(total), Some(rated)) if total > 0 && rated >= total)
     }
 }
 
@@ -486,7 +531,13 @@ pub fn rank_pool(genre: Option<&str>) -> RankPool {
 pub fn assign_ranks(artists: &mut [Artist]) {
     let mut pools: std::collections::HashMap<(i64, RankPool), Vec<f64>> =
         std::collections::HashMap::new();
-    for album in artists.iter().flat_map(|artist| &artist.albums) {
+    // Only fully rated albums are ranked against; an album still being rated
+    // is placed among them without pushing them down.
+    for album in artists
+        .iter()
+        .flat_map(|artist| &artist.albums)
+        .filter(|album| album.is_fully_rated())
+    {
         if let (Some(year), Some(score)) = (album.year, album.score) {
             pools
                 .entry((year, rank_pool(album.genre.as_deref())))
@@ -541,7 +592,8 @@ mod tests {
             year,
             publisher: None,
             genre: Some(genre.to_owned()),
-            total_tracks: None,
+            total_tracks: Some(10),
+            rated_tracks: Some(10),
             total_seconds: None,
             rating,
             score,
@@ -573,6 +625,15 @@ mod tests {
                 ranked(Some(2026), "Soundtrack", Some(300.0), None),
                 ranked(Some(2026), "Rock", None, None),
                 ranked(None, "Rock", Some(50.0), None),
+                // Partly rated: placed among the finished albums, never counted.
+                Album {
+                    rated_tracks: Some(3),
+                    ..ranked(Some(2026), "Rock", Some(400.0), None)
+                },
+                Album {
+                    rated_tracks: Some(3),
+                    ..ranked(Some(2026), "Pop", Some(9.0), None)
+                },
             ],
         }];
         assign_ranks(&mut artists);
@@ -588,7 +649,9 @@ mod tests {
                 Some(2),
                 Some(1),
                 None,
-                None
+                None,
+                Some(1),
+                Some(3)
             ]
         );
         assert_eq!(rank_pool(Some(" drama ")), RankPool::Scores);

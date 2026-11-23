@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.27.1] - 2026-11-23
+
+### Changed
+
+- **Rank** counts only fully rated albums (every track rated), matching Aurora and the Album Score chart. An album still being rated is placed among the finished albums of its year, so its Rank moves as you rate it, but it never pushes a finished album down. Rank turns green once every track of the album is rated.
+
 ## [0.27.0] - 2026-11-22
 
 ### Added

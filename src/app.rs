@@ -85,6 +85,8 @@ pub(crate) mod color {
     pub const CHART: u32 = 0xc084fc;
     /// The flame on an album's most-listened tracks on Last.fm.
     pub const FLAME: u32 = 0xfb923c;
+    /// A Rank whose album has every track rated.
+    pub const COMPLETE: u32 = 0x78d5a1;
     /// Empty stars and hearts.
     pub const UNSET: u32 = 0x3a4052;
     /// The waveform in the seek bar: played from start to end of the track,
@@ -2127,7 +2129,7 @@ impl AuroraApp {
                 track.loved = fresh.loved;
             }
         }
-        if let Ok((rating, score)) = album_rating {
+        if let Ok(fresh) = album_rating {
             for album in self
                 .library
                 .iter_mut()
@@ -2135,8 +2137,10 @@ impl AuroraApp {
                 .flat_map(|artist| artist.albums.iter_mut())
                 .filter(|album| album.id == album_id)
             {
-                album.rating = rating;
-                album.score = score;
+                album.rating = fresh.rating;
+                album.score = fresh.score;
+                album.total_tracks = fresh.total_tracks;
+                album.rated_tracks = fresh.rated_tracks;
             }
             // A new score can move every album of the year up or down.
             crate::library::assign_ranks(&mut self.library);
@@ -2834,12 +2838,19 @@ impl AuroraApp {
                     .map_or_else(|| "—".to_owned(), |score| format!("{score:.2}"))
             ))
             .child("·")
-            .child(format!(
-                "Rank: {}",
-                album
-                    .rank
-                    .map_or_else(|| "—".to_owned(), |rank| rank.to_string())
-            ))
+            .child(
+                // Green once every track is rated: the Rank is final.
+                div()
+                    .when(album.rank.is_some() && album.is_fully_rated(), |rank| {
+                        rank.text_color(rgb(color::COMPLETE))
+                    })
+                    .child(format!(
+                        "Rank: {}",
+                        album
+                            .rank
+                            .map_or_else(|| "—".to_owned(), |rank| rank.to_string())
+                    )),
+            )
     }
 
     /// The open album's details: what it is, then its tracks.
