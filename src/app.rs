@@ -1077,17 +1077,25 @@ impl AuroraApp {
         }
     }
 
-    /// Jumps to the first artist whose name starts with what was typed.
+    /// Jumps to the first artist whose name starts with what was typed,
+    /// ignoring accents: `gu` reaches Günther.
     fn jump_to_artist(&mut self, cx: &mut Context<Self>) {
-        let prefix = self.type_ahead.as_str();
-        let ix = self
+        let prefix = crate::search::fold(&self.type_ahead);
+        let exact = self
             .artists
-            .partition_point(|artist| artist.sort_key.as_str() < prefix);
-        if self
+            .partition_point(|artist| artist.sort_key.as_str() < self.type_ahead.as_str());
+        let found = if self
             .artists
-            .get(ix)
-            .is_some_and(|artist| artist.sort_key.starts_with(prefix))
+            .get(exact)
+            .is_some_and(|artist| artist.sort_key.starts_with(self.type_ahead.as_str()))
         {
+            Some(exact)
+        } else {
+            self.artists
+                .iter()
+                .position(|artist| crate::search::fold(&artist.sort_key).starts_with(&prefix))
+        };
+        if let Some(ix) = found {
             self.select_artist(ix, cx);
             self.artist_scroll.scroll_to_item(ix, ScrollStrategy::Top);
             if self.cover_wall {

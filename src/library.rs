@@ -572,6 +572,24 @@ pub fn register_functions(connection: &Connection) -> Result<(), String> {
                     .map(|text| text.to_lowercase()))
             },
         )
+        .map_err(|error| format!("Could not prepare the catalog: {error}"))?;
+    // Exact searches: case and accents do not count.
+    connection
+        .create_scalar_function(
+            "search_fold_eq",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let text = |index| match context.get_raw(index) {
+                    rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                    _ => None,
+                };
+                Ok(match (text(0), text(1)) {
+                    (Some(value), Some(folded)) => crate::search::fold_eq(value, folded),
+                    _ => false,
+                })
+            },
+        )
         .map_err(|error| format!("Could not prepare the catalog: {error}"))
 }
 

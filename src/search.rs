@@ -1110,6 +1110,47 @@ pub fn artist_key_sql(field: &str) -> String {
     format!("COALESCE(NULLIF(TRIM(unicode_lower({normalized})), ''), 'unknown')")
 }
 
+/// Lowercase without accents, so `gunther` finds Günther and `tiesto`
+/// Tiësto, like the catalog's word index already does. Same as Aurora's
+/// `search_fold`.
+pub fn fold(value: &str) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    if value.is_ascii() {
+        return value.to_ascii_lowercase();
+    }
+    value
+        .to_lowercase()
+        .nfd()
+        .filter(|character| !is_combining_mark(*character))
+        .fold(
+            String::with_capacity(value.len()),
+            |mut folded, character| {
+                match character {
+                    'æ' => folded.push_str("ae"),
+                    'œ' => folded.push_str("oe"),
+                    'ß' => folded.push_str("ss"),
+                    'þ' => folded.push_str("th"),
+                    'ø' => folded.push('o'),
+                    'ð' | 'đ' => folded.push('d'),
+                    'ł' => folded.push('l'),
+                    'ı' => folded.push('i'),
+                    _ => folded.push(character),
+                }
+                folded
+            },
+        )
+}
+
+/// Whether `value` folds to `folded` (already passed through [`fold`]).
+/// ASCII values, most of the catalog, skip allocating.
+pub fn fold_eq(value: &str, folded: &str) -> bool {
+    if value.is_ascii() {
+        value.eq_ignore_ascii_case(folded)
+    } else {
+        fold(value) == folded
+    }
+}
+
 fn escape_like(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1145,8 +1186,8 @@ fn track_predicate(
             let parts: Vec<String> = columns
                 .iter()
                 .map(|column| {
-                    params.push(Value::Text(value.clone()));
-                    format!("TRIM(COALESCE({alias}.{column}, '')) = ? COLLATE NOCASE")
+                    params.push(Value::Text(fold(value)));
+                    format!("search_fold_eq(TRIM(COALESCE({alias}.{column}, '')), ?)")
                 })
                 .collect();
             Some(format!("({narrow}({}))", parts.join(" OR ")))
@@ -1964,6 +2005,46 @@ mod tests {
         let connection = catalog();
         assert_eq!(ids(&connection, "aartist:\"bon jovi\""), ["bj"]);
         assert_eq!(ids(&connection, "aartist:bon jovi"), ["bj", "jbj"]);
+    }
+
+    #[test]
+    fn accents_do_not_count() {
+        let connection = catalog();
+        connection
+            .execute_batch(
+                "INSERT INTO albums (id, album, album_artist_display, canonical_genre, year,
+                    rating_completeness, loved_tracks, total_seconds)
+                 VALUES ('pleasureman', 'Pleasureman', 'Günther', 'Eurodance', 2004, 1.0, 0, 2400);
+                 INSERT INTO tracks (id, album_id, title, display_artist, album_artist_display,
+                    album, canonical_genre, year)
+                 VALUES (100, 'pleasureman', 'Ding Dong Song', 'Günther', 'Günther', 'Pleasureman', 'Eurodance', 2004);
+                 INSERT INTO track_search_fts (track_id, album_id, title, display_artist, album,
+                    album_artist_display, canonical_genre)
+                 VALUES ('100', 'pleasureman', 'Ding Dong Song', 'Günther', 'Pleasureman', 'Günther', 'Eurodance');",
+            )
+            .unwrap();
+        for query in [
+            "aartist:gunther",
+            "gunther",
+            "aartist:\"gunther\"",
+            "aartist:\"GÜNTHER\"",
+            "artist:\"Gunther\"",
+        ] {
+            assert_eq!(ids(&connection, query), ["pleasureman"], "{query}");
+        }
+        assert!(ids(&connection, "aartist:\"gunter\"").is_empty());
+    }
+
+    #[test]
+    fn fold_drops_case_and_accents() {
+        assert_eq!(fold("Tiësto"), "tiesto");
+        assert_eq!(fold("Mötley Crüe"), "motley crue");
+        assert_eq!(fold("Røyksopp"), "royksopp");
+        assert_eq!(fold("Sæglópur"), "saeglopur");
+        assert_eq!(fold("AC/DC"), "ac/dc");
+        assert!(fold_eq("Günther", "gunther"));
+        assert!(fold_eq("KISS", "kiss"));
+        assert!(!fold_eq("Kiss", "kis"));
     }
 
     #[test]

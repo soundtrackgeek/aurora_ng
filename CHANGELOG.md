@@ -2,6 +2,12 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.28.1] - 2026-11-23
+
+### Fixed
+
+- **Accents no longer get in the way of finding artists**: exact searches in quotes ignore accents, so `aartist:"gunther"` finds Günther and `aartist:"tiesto"` finds Tiësto, as unquoted searches like `aartist:gunther` already did. Typing an artist's name to jump to them works without accents too: `gu` reaches Günther.
+
 ## [0.28.0] - 2026-11-23
 
 ### Added
