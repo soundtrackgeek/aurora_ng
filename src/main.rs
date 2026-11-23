@@ -14,6 +14,7 @@ mod popularity;
 mod rating;
 mod rating_log;
 mod search;
+mod search_help;
 mod settings;
 mod shortcuts;
 mod sound;

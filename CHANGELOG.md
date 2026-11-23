@@ -2,6 +2,16 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.28.2] - 2026-11-23
+
+### Added
+
+- The search bar's **Syntax** panel shows field examples and offers clickable completions as you type. Syntax errors appear before a catalog search runs.
+
+### Changed
+
+- Album search starts after a 450 ms pause. Enter still searches immediately.
+
 ## [0.28.1] - 2026-11-23
 
 ### Fixed

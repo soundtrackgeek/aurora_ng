@@ -1,0 +1,3 @@
+genre|scores|ambient|ambient pop|anime|chiptune|classical|country|disco|folk|hip hop|indie rock|jazz|pop|rock|soundtrack|synthpop|synthwave|video game
+country|Australia|Brazil|Canada|Denmark|Finland|France|Germany|Iceland|Italy|Japan|Netherlands|Norway|South Korea|Spain|Sweden|United Kingdom|United States
+sound|orchestral|choir|strings|piano|guitar|synth|hybrid|ambient|percussion|chiptune|jazz|vocals

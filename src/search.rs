@@ -307,6 +307,40 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
+/// A second field needs its own clause. Ignore colons inside quoted values.
+fn missing_clause_separator(clause: &str) -> Option<&str> {
+    let (field, value) = split_field(clause)?;
+    if !value.starts_with('"')
+        && !matches!(
+            field,
+            Field::Extended(_)
+                | Field::Year
+                | Field::ReleaseYear
+                | Field::Completeness
+                | Field::Love
+                | Field::Single
+                | Field::Sound
+        )
+    {
+        return None;
+    }
+    let mut quoted = false;
+    for (index, character) in value.char_indices() {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        if !quoted && character.is_whitespace() {
+            let rest = value[index..].trim_start();
+            if let Some((name, _)) = rest.split_once([':', '='])
+                && Field::parse(name.trim_start_matches('-')).is_some()
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// `field:value` or `field=value`, when the part before the separator is a field.
 fn split_field(value: &str) -> Option<(Field, &str)> {
     let (separator, _) = value
@@ -547,6 +581,10 @@ pub fn parse(input: &str) -> Result<Search, String> {
                         alternatives: Vec::new(),
                     });
                     pending_not = false;
+                }
+
+                if let Some(field) = missing_clause_separator(raw) {
+                    return Err(format!("Add AND or a comma before {field}:."));
                 }
 
                 // Alternatives after OR use the field before them.

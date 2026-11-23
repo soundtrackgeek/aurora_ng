@@ -9,7 +9,7 @@ use crate::{
     music_library, popularity,
     rating::{self, Change, Love, PendingRating, Stars, Values},
     rating_log::{self, TrackNames},
-    search,
+    search, search_help,
     settings::SeekBarColour,
     settings::{self, SavedWindow, Settings},
     shortcuts,
@@ -42,7 +42,7 @@ const TICK: Duration = Duration::from_millis(250);
 const TYPE_AHEAD_WINDOW: Duration = Duration::from_millis(1000);
 /// A search starts once typing has paused this long, so it does not run for
 /// every letter of a query. Enter searches right away.
-const SEARCH_DELAY: Duration = Duration::from_secs(2);
+const SEARCH_DELAY: Duration = Duration::from_millis(450);
 
 /// Cover wall tiles: the square cover, then two lines of text when there is room.
 const TILE_MIN: f32 = 50.;
@@ -205,6 +205,7 @@ struct RatingStatus {
 
 struct Loaded {
     catalog: Catalog,
+    search_values: search_help::CatalogValues,
     artists: Vec<Artist>,
     covers: Result<usize, String>,
 }
@@ -239,6 +240,8 @@ pub struct AuroraApp {
     album_count: usize,
 
     search_input: Entity<TextInput>,
+    search_help_open: bool,
+    search_values: search_help::CatalogValues,
     /// The query the shown albums match; `None` shows the whole library.
     search: Option<String>,
     search_state: SearchState,
@@ -396,6 +399,7 @@ impl AuroraApp {
         let loading = cx.background_executor().spawn(async move {
             let catalog = Catalog::open(&catalog_path()?)?;
             let mut artists = catalog.artists()?;
+            let search_values = search_help::CatalogValues::from_library(&artists);
             let covers = CoverIndex::scan(&covers::covers_dir()).map(|index| {
                 let mut found = 0;
                 for album in artists.iter_mut().flat_map(|artist| &mut artist.albums) {
@@ -409,6 +413,7 @@ impl AuroraApp {
             });
             Ok::<_, String>(Loaded {
                 catalog,
+                search_values,
                 artists,
                 covers,
             })
@@ -462,6 +467,8 @@ impl AuroraApp {
             artists: Vec::new(),
             album_count: 0,
             search_input,
+            search_help_open: false,
+            search_values: search_help::CatalogValues::default(),
             search: None,
             search_state: SearchState::Idle,
             search_task: None,
@@ -543,10 +550,12 @@ impl AuroraApp {
         match result {
             Ok(Loaded {
                 catalog,
+                search_values,
                 artists,
                 covers,
             }) => {
                 self.covers_found = covers;
+                self.search_values = search_values;
                 self.catalog = Some(catalog);
                 self.library_album_count = artists.iter().map(|artist| artist.albums.len()).sum();
                 self.library = artists;
@@ -664,23 +673,9 @@ impl AuroraApp {
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputEvent::Changed => {
-                // A query still running is for text that is gone now.
-                if let Some(interrupt) = self.search_interrupt.take() {
-                    interrupt.interrupt();
-                }
-                self.search_state = SearchState::Idle;
-                if self.search_text(cx).trim().is_empty() {
-                    // Clearing the box shows everything at once.
-                    self.run_search(cx);
-                } else {
-                    self.search_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(SEARCH_DELAY).await;
-                        this.update(cx, |this, cx| this.run_search(cx)).ok();
-                    }));
-                }
-            }
+            InputEvent::Changed => self.schedule_search(cx),
             InputEvent::Submit => {
+                self.search_help_open = false;
                 // Enter on a random sort that is already shown draws again.
                 if !self.run_search(cx) && self.sort == Some(search::Sort::Random) {
                     self.reshuffle(cx);
@@ -688,7 +683,9 @@ impl AuroraApp {
             }
             // Esc clears the search; a second Esc leaves the box.
             InputEvent::Cancel => {
-                if self.search_text(cx).is_empty() {
+                if self.search_help_open {
+                    self.search_help_open = false;
+                } else if self.search_text(cx).is_empty() {
                     window.focus(&self.focus_handle);
                 } else {
                     self.search_input
@@ -696,6 +693,26 @@ impl AuroraApp {
                     self.run_search(cx);
                 }
             }
+        }
+        cx.notify();
+    }
+
+    fn schedule_search(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
+        if let Some(interrupt) = self.search_interrupt.take() {
+            interrupt.interrupt();
+        }
+        self.search_state = SearchState::Idle;
+        let query = self.search_text(cx);
+        if query.trim().is_empty() {
+            self.run_search(cx);
+        } else if let Err(error) = search_help::parse(query.trim()) {
+            self.search_state = SearchState::Failed(error);
+        } else {
+            self.search_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SEARCH_DELAY).await;
+                this.update(cx, |this, cx| this.run_search(cx)).ok();
+            }));
         }
         cx.notify();
     }
@@ -725,9 +742,7 @@ impl AuroraApp {
         }
         cx.notify();
 
-        let parsed = search::split_view(&query)
-            .and_then(|(filter, view)| search::parse(&filter).map(|parsed| (parsed, view)));
-        let (parsed, view) = match parsed {
+        let (parsed, view) = match search_help::parse(&query) {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.search_state = SearchState::Failed(error);
@@ -739,19 +754,9 @@ impl AuroraApp {
             .group
             .is_some_and(|group| group.field == search::GroupField::Sound);
         // `sort:vibe` ranks by the search's first `vibe:` description.
-        let vibe = match view.sort {
-            Some(search::Sort::Vibe) => match parsed.vibes().first() {
-                Some(text) => Some((*text).to_owned()),
-                None => {
-                    self.search_state = SearchState::Failed(
-                        "sort:vibe orders by a vibe: description, like vibe:\"dark ambient\" sort:vibe."
-                            .to_owned(),
-                    );
-                    return true;
-                }
-            },
-            _ => None,
-        };
+        let vibe = (view.sort == Some(search::Sort::Vibe))
+            .then(|| parsed.vibes().first().map(|text| (*text).to_owned()))
+            .flatten();
         if parsed.is_empty() && !wants_sound {
             // Nothing to filter, though there may be a sort or group.
             self.search_state = SearchState::Idle;
@@ -2318,6 +2323,49 @@ impl AuroraApp {
         }
     }
 
+    fn render_search_help(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.search_input.read(cx).text();
+        let completions = search_help::suggestions(query, &self.search_values);
+        div()
+            .id("search-help")
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .px_4()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .bg(rgb(color::PANEL))
+            .border_b_1()
+            .border_color(rgb(color::BORDER))
+            .child("Use AND or a comma to combine, OR for alternatives, and NOT to exclude. Quotes match a full value. Enter searches now.")
+            .child(muted("Use : or = after a field. Ranges use .. and include both ends."))
+            .when_some(match &self.search_state {
+                SearchState::Failed(error) => Some(error),
+                _ => None,
+            }, |panel, error| panel.child(div().text_color(rgb(color::ERROR)).child(error.clone())))
+            .when(!completions.is_empty(), |panel| {
+                panel.child(div().flex().flex_wrap().gap_2().children(
+                    completions.into_iter().enumerate().map(|(index, (label, query))| {
+                        text_button(("search-completion", index), label, false).on_click(
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.search_input.update(cx, |input, cx| input.set_text(query.clone(), cx));
+                                window.focus(&this.search_input.focus_handle(cx));
+                                this.schedule_search(cx);
+                            }),
+                        )
+                    }),
+                ))
+            })
+            .child(div().flex().flex_wrap().gap_x_4().gap_y_1().children(
+                search_help::fields().map(|(name, label, example)| {
+                    div().w(px(310.)).text_xs().child(format!("{name}: {label}")).child(
+                        div().text_color(rgb(color::MUTED)).child(example),
+                    )
+                }),
+            ))
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = match &self.load_state {
             LoadState::Loading => "Loading library…".into(),
@@ -2412,6 +2460,17 @@ impl AuroraApp {
                     .min_w(px(160.))
                     .max_w(px(560.))
                     .child(self.search_input.clone()),
+            )
+            .child(
+                text_button("search-syntax", "Syntax", self.search_help_open).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.search_help_open = !this.search_help_open;
+                        if this.search_help_open {
+                            window.focus(&this.search_input.focus_handle(cx));
+                        }
+                        cx.notify();
+                    }),
+                ),
             )
             .when(
                 self.sort == Some(search::Sort::Random)
@@ -3372,6 +3431,9 @@ impl Render for AuroraApp {
             .font_family("Segoe UI")
             .text_sm()
             .child(self.render_header(cx))
+            .when(self.search_help_open, |root| {
+                root.child(self.render_search_help(cx))
+            })
             .child(div().flex_1().min_h_0().child(body))
             .child(self.render_now_playing(cx))
     }
@@ -3477,7 +3539,11 @@ fn icon_button(id: &'static str, icon: &'static str, primary: bool) -> Stateful<
         )
 }
 
-fn text_button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> Stateful<Div> {
+fn text_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    primary: bool,
+) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
