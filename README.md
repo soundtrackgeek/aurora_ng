@@ -4,7 +4,7 @@
 
 Aurora NG is [Aurora](https://github.com/soundtrackgeek/aurora) rebuilt as a native Rust app with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind the Zed editor.
 
-Version **0.28.2** browses and searches your library, shows a wall of album covers with their chart positions, singles and most popular tracks, plays music, rates and loves tracks (also with Windows-wide shortcuts), counts your plays together with Aurora and Music Library, and keeps itself up to date.
+Version **0.28.3** browses and searches your library, shows a wall of album covers with their chart positions, singles and most popular tracks, plays music, rates and loves tracks (also with Windows-wide shortcuts), counts your plays together with Aurora and Music Library, and keeps itself up to date.
 
 ## What it does
 
@@ -112,13 +112,13 @@ It opens the catalog read-only and never changes it; when you rate a track, Musi
 
 ## Album covers
 
-The cover wall uses one image per album, named after the album's folder: the album in `D:\MUSIC\Kittie - Oracle (2001)` uses `Kittie - Oracle (2001).jpg` (JPG, PNG, GIF or BMP; case does not matter). Covers are read from
+The cover wall shows the image Music Library lists for each album in the catalog's `album_covers` table, the same one Aurora shows. The images are in
 
 ```
 C:\_code\music_backup_v5\AlbumCovers
 ```
 
-To use another folder, set the `AURORA_NG_COVERS` environment variable to it. Albums without a cover show their title instead. The header shows how many albums have a cover.
+Covers are matched by album, not by file name, so an image named differently from the album's folder is still found: the folder `Black Eyed Peas - Elephunk (2003)` gets `The Black Eyed Peas - Elephunk (2003).jpg`. Albums without a cover show their title instead. The header shows how many albums have a cover.
 
 The original images are never changed. Square copies are made as you scroll, in four sizes (128, 256, 512 and 1024 pixels) so covers stay sharp at every size on the slider. They are saved in `%LOCALAPPDATA%\aurora_ng\thumbnails`, so covers load instantly the next time. That folder can be deleted at any time; the copies are made again when needed.
 

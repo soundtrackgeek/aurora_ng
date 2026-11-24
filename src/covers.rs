@@ -1,10 +1,9 @@
-//! Album covers: one image per album folder, named after the folder
-//! ("Artist - Album (Year).jpg"), shrunk to small thumbnails for the cover wall.
+//! Album covers: the image Music Library lists for each album in its
+//! `album_covers` table, shrunk to small thumbnails for the cover wall.
 
 use gpui::RenderImage;
 use image::{DynamicImage, Frame, ImageReader, RgbaImage, codecs::jpeg::JpegEncoder};
 use std::{
-    collections::HashMap,
     fs,
     io::BufWriter,
     path::{Path, PathBuf},
@@ -24,13 +23,6 @@ pub fn thumbnail_size(tile_px: f32) -> u32 {
         .unwrap_or(THUMBNAIL_SIZES[THUMBNAIL_SIZES.len() - 1])
 }
 
-/// `C:\_code\music_backup_v5\AlbumCovers`, unless `AURORA_NG_COVERS` points somewhere else.
-pub fn covers_dir() -> PathBuf {
-    std::env::var_os("AURORA_NG_COVERS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\_code\music_backup_v5\AlbumCovers"))
-}
-
 /// `%LOCALAPPDATA%\aurora_ng\thumbnails`, created if needed.
 pub fn thumbnail_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
@@ -38,49 +30,6 @@ pub fn thumbnail_dir() -> Option<PathBuf> {
         .join("thumbnails");
     fs::create_dir_all(&dir).ok()?;
     Some(dir)
-}
-
-/// Every cover image in the covers folder, by lowercase file name without extension.
-pub struct CoverIndex {
-    by_name: HashMap<String, PathBuf>,
-}
-
-impl CoverIndex {
-    pub fn scan(dir: &Path) -> Result<Self, String> {
-        let entries = fs::read_dir(dir)
-            .map_err(|error| format!("Album covers not found at {}: {error}", dir.display()))?;
-        let mut by_name = HashMap::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_image = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    matches!(
-                        extension.to_ascii_lowercase().as_str(),
-                        "jpg" | "jpeg" | "png" | "gif" | "bmp"
-                    )
-                });
-            if let (true, Some(stem)) = (is_image, path.file_stem().and_then(|stem| stem.to_str()))
-            {
-                by_name.entry(stem.to_lowercase()).or_insert(path);
-            }
-        }
-        Ok(Self { by_name })
-    }
-
-    /// The cover for an album folder like `D:\MUSIC\Kittie - Oracle (2001)`.
-    /// Disc folders (`...\Album (2001)\CD1`) fall back to the album folder.
-    pub fn find(&self, folder: &str) -> Option<PathBuf> {
-        let mut names = folder
-            .split(['\\', '/'])
-            .rev()
-            .filter(|part| !part.is_empty());
-        let lookup = |name: Option<&str>| {
-            name.and_then(|name| self.by_name.get(&name.to_lowercase()).cloned())
-        };
-        lookup(names.next()).or_else(|| lookup(names.next()))
-    }
 }
 
 /// A square thumbnail of `cover`, `size` pixels per side, ready to draw. Reuses the copy saved in
@@ -173,33 +122,6 @@ fn render_image(mut pixels: RgbaImage) -> RenderImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn index(names: &[&str]) -> CoverIndex {
-        CoverIndex {
-            by_name: names
-                .iter()
-                .map(|name| (name.to_lowercase(), PathBuf::from(format!("{name}.jpg"))))
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn finds_covers_by_folder_name() {
-        let covers = index(&["Kittie - Oracle (2001)"]);
-        assert_eq!(
-            covers.find(r"D:\MUSIC\Kittie - Oracle (2001)"),
-            Some(PathBuf::from("Kittie - Oracle (2001).jpg"))
-        );
-        assert_eq!(
-            covers.find(r"D:\MUSIC\kittie - oracle (2001)\"),
-            Some(PathBuf::from("Kittie - Oracle (2001).jpg"))
-        );
-        assert_eq!(
-            covers.find(r"D:\MUSIC\Kittie - Oracle (2001)\CD1"),
-            Some(PathBuf::from("Kittie - Oracle (2001).jpg"))
-        );
-        assert_eq!(covers.find(r"D:\MUSIC\Kittie - Spit (1999)"), None);
-    }
 
     #[test]
     fn picks_the_smallest_thumbnail_that_fits() {

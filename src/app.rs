@@ -3,7 +3,7 @@
 
 use crate::{
     audio::Audio,
-    covers::{self, CoverIndex},
+    covers,
     history::{History, Outcome, Session, Stats, TrackInfo},
     library::{Album, Artist, Catalog, Track, catalog_path},
     music_library, popularity,
@@ -398,19 +398,17 @@ impl AuroraApp {
         // Reading 74k albums takes a moment, so it happens off the UI thread.
         let loading = cx.background_executor().spawn(async move {
             let catalog = Catalog::open(&catalog_path()?)?;
-            let mut artists = catalog.artists()?;
+            let artists = catalog.artists()?;
             let search_values = search_help::CatalogValues::from_library(&artists);
-            let covers = CoverIndex::scan(&covers::covers_dir()).map(|index| {
-                let mut found = 0;
-                for album in artists.iter_mut().flat_map(|artist| &mut artist.albums) {
-                    album.cover = album
-                        .folder
-                        .as_deref()
-                        .and_then(|folder| index.find(folder));
-                    found += usize::from(album.cover.is_some());
-                }
-                found
-            });
+            let covers = if catalog.has_covers() {
+                Ok(artists
+                    .iter()
+                    .flat_map(|artist| &artist.albums)
+                    .filter(|album| album.cover.is_some())
+                    .count())
+            } else {
+                Err("This Music Library catalog does not list album covers.".to_owned())
+            };
             Ok::<_, String>(Loaded {
                 catalog,
                 search_values,
@@ -2698,7 +2696,7 @@ impl AuroraApp {
                         .border_b_1()
                         .border_color(rgb(color::BORDER))
                         .child(format!(
-                            "{error} Set AURORA_NG_COVERS to the folder with your album covers."
+                            "{error} Update Music Library and import your album covers."
                         )),
                 )
             })

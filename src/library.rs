@@ -29,9 +29,7 @@ pub struct Album {
     pub rank: Option<u32>,
     /// How many of the album's tracks are marked Love.
     pub loved_tracks: Option<i64>,
-    /// The folder the album's files are in, like `D:\MUSIC\Kittie - Oracle (2001)`.
-    pub folder: Option<String>,
-    /// Filled in from the covers folder after loading.
+    /// The album's image in the covers folder, from Music Library's `album_covers`.
     pub cover: Option<PathBuf>,
     /// Best album chart positions: Billboard, Official UK, VG Lista.
     pub charts: Vec<ChartPeak>,
@@ -177,6 +175,8 @@ pub struct Catalog {
     /// Albums count their loved tracks.
     has_loved_tracks: bool,
     has_rated_tracks: bool,
+    /// Music Library maps each album to its image in the covers folder.
+    has_covers: bool,
 }
 
 impl Catalog {
@@ -228,6 +228,7 @@ impl Catalog {
             has_origins && has_column("musicbrainz_artist_origin_countries", "country_name")?;
         let has_loved_tracks = has_column("albums", "loved_tracks")?;
         let has_rated_tracks = has_column("albums", "rated_tracks")?;
+        let has_covers = has_table("album_covers")?;
         Ok(Self {
             connection,
             has_singles,
@@ -235,7 +236,13 @@ impl Catalog {
             has_origin_names,
             has_loved_tracks,
             has_rated_tracks,
+            has_covers,
         })
+    }
+
+    /// Whether the catalog says which image is each album's cover.
+    pub fn has_covers(&self) -> bool {
+        self.has_covers
     }
 
     /// Stops a query running on this connection from another thread.
@@ -285,12 +292,19 @@ impl Catalog {
             "NULL"
         };
         let rated = self.rated_tracks_sql();
+        // Matched by album, as Aurora does: the image's name often differs
+        // from the folder's (another year, "The" in front of the artist).
+        let cover = if self.has_covers {
+            "(SELECT c.cache_path FROM album_covers c
+              WHERE c.album_id = a.id AND c.file_size_bytes > 0)"
+        } else {
+            "NULL"
+        };
         let mut statement = self
             .connection
             .prepare(&format!(
                 "SELECT a.id, a.album, a.album_artist_display, a.year,
-                        (SELECT file_path FROM tracks t WHERE t.album_id = a.id LIMIT 1),
-                        a.publisher, a.total_tracks, a.total_seconds,
+                        {cover}, a.publisher, a.total_tracks, a.total_seconds,
                         a.effective_album_rating, a.album_score, a.canonical_genre,
                         a.billboard_rank, a.official_uk_rank, a.vg_lista_rank, {country},
                         {loved}, {rated}
@@ -327,7 +341,7 @@ impl Catalog {
                 title,
                 artist,
                 year,
-                folder,
+                cover,
                 publisher,
                 total_tracks,
                 total_seconds,
@@ -368,8 +382,7 @@ impl Catalog {
                 score,
                 rank: None,
                 loved_tracks,
-                folder: non_empty(folder),
-                cover: None,
+                cover: non_empty(cover).map(|path| cover_path(&path)),
                 sound: None,
                 vibe: None,
                 charts,
@@ -599,6 +612,12 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Music Library stores `\\?\C:\...` paths. Without the prefix they name the
+/// same file and give the same thumbnail cache names as before.
+fn cover_path(path: &str) -> PathBuf {
+    PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,7 +636,6 @@ mod tests {
             score,
             rank: None,
             loved_tracks: None,
-            folder: None,
             cover: None,
             charts: Vec::new(),
             sound: None,
@@ -806,6 +824,50 @@ mod tests {
                     "Michael Jackson".to_owned(),
                     Some("flags/us.svg".to_owned()),
                     Some("United States".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn albums_take_their_cover_from_the_catalog() {
+        let catalog = catalog(true);
+        // Without the table, older catalogs load without covers.
+        assert!(!catalog.has_covers());
+        assert!(
+            catalog.artists().unwrap()[0]
+                .albums
+                .iter()
+                .all(|album| album.cover.is_none())
+        );
+
+        catalog
+            .connection
+            .execute_batch(
+                r"CREATE TABLE album_covers (album_id TEXT PRIMARY KEY, cache_path TEXT,
+                    file_size_bytes INTEGER);
+                 INSERT INTO album_covers VALUES
+                    ('thriller', '\\?\C:\Covers\Michael Jackson - Thriller (1982).jpg', 100),
+                    ('bad', 'C:\Covers\Michael Jackson - Bad (1987).jpg', 0);",
+            )
+            .unwrap();
+        let catalog = Catalog::with_connection(catalog.connection).unwrap();
+        assert!(catalog.has_covers());
+        let covers: Vec<_> = catalog.artists().unwrap()[0]
+            .albums
+            .iter()
+            .map(|album| (album.id.clone(), album.cover.clone()))
+            .collect();
+        assert_eq!(
+            covers,
+            [
+                // An empty image counts as no cover.
+                ("bad".to_owned(), None),
+                (
+                    "thriller".to_owned(),
+                    Some(PathBuf::from(
+                        r"C:\Covers\Michael Jackson - Thriller (1982).jpg"
+                    ))
                 ),
             ]
         );

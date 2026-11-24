@@ -2,6 +2,16 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.28.3] - 2026-11-24
+
+### Fixed
+
+- **Covers are found by album, as in Aurora**: the cover wall takes each album's image from Music Library's `album_covers` table instead of looking for a file named after the album's folder. Albums whose image has another name now show it, like L'Amour Toujours (folder 2001, image 1999) and Elephunk (image "The Black Eyed Peas - …"). The app also starts faster, because it no longer reads the whole covers folder.
+
+### Removed
+
+- The `AURORA_NG_COVERS` environment variable. The catalog says where each cover is.
+
 ## [0.28.2] - 2026-11-23
 
 ### Added
