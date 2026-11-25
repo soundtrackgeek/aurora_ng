@@ -328,6 +328,7 @@ pub struct AuroraApp {
     queue_genre: Option<String>,
     current: Option<usize>,
     playback_error: Option<String>,
+    dragging_seek: bool,
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// The playing track's waveform, drawn in the seek bar once it has
     /// been read from the file.
@@ -526,6 +527,7 @@ impl AuroraApp {
             queue_genre: None,
             current: None,
             playback_error: None,
+            dragging_seek: false,
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             waveform: None,
             _waveform_task: None,
@@ -691,9 +693,14 @@ impl AuroraApp {
                 self.search_help_open = false;
                 self.search_history_index = None;
                 self.search_draft.clear();
+                let ran = self.run_search(cx);
                 // Enter on a random sort that is already shown draws again.
-                if !self.run_search(cx) && self.sort == Some(search::Sort::Random) {
+                if !ran && self.sort == Some(search::Sort::Random) {
                     self.reshuffle(cx);
+                } else if !matches!(self.search_state, SearchState::Failed(_))
+                    && self.sort != Some(search::Sort::Random)
+                {
+                    window.focus(&self.focus_handle);
                 }
             }
             // Esc clears the search; a second Esc leaves the box.
@@ -1299,6 +1306,81 @@ impl AuroraApp {
         });
     }
 
+    /// Scrolls the cover wall just enough to keep `ix` visible when it is
+    /// already near the viewport, or jumps to it when offscreen.
+    fn ensure_wall_album_visible(&mut self, ix: usize) {
+        let ix = ix.min(self.album_count.saturating_sub(1));
+        let row = self.row_of(ix);
+        let item = self.row_item(row);
+        if let Some(bounds) = self.wall_list.bounds_for_item(item) {
+            let view = self.wall_list.viewport_bounds();
+            if bounds.top() < view.top() {
+                self.wall_list.scroll_by(bounds.top() - view.top());
+            } else if bounds.bottom() > view.bottom() {
+                self.wall_list.scroll_by(bounds.bottom() - view.bottom());
+            }
+        } else {
+            self.scroll_wall_to_album(ix);
+        }
+    }
+
+    /// Jumps to the currently playing album (opening its details on the cover
+    /// wall, or selecting it in the columns), clearing an active search filter
+    /// if the playing album is hidden by it.
+    fn jump_to_playing_album(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.load_state, LoadState::Ready) {
+            return;
+        }
+        let Some((album_id, track_id)) = self
+            .current_track()
+            .map(|track| (track.album_id.clone(), track.id))
+        else {
+            return;
+        };
+        let mut location = self.find_album(&album_id);
+        if location.is_none() && self.filtered {
+            self.search_history_index = None;
+            self.search_draft.clear();
+            self.search_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            self.search_task = None;
+            if let Some(interrupt) = self.search_interrupt.take() {
+                interrupt.interrupt();
+            }
+            self.search_state = SearchState::Idle;
+            self.search = None;
+            self.sort = None;
+            self.group = None;
+            self.show_matches(None, cx);
+            location = self.find_album(&album_id);
+        }
+        let Some((artist, album)) = location else {
+            return;
+        };
+        if self.selected_artist != Some(artist) || self.selected_album != Some(album) {
+            self.selected_artist = Some(artist);
+            self.select_album(album, cx);
+        }
+        self.selected_track = self.tracks.iter().position(|track| track.id == track_id);
+        if let Some(track_ix) = self.selected_track {
+            self.track_scroll
+                .scroll_to_item(track_ix, ScrollStrategy::Center);
+        }
+        if self.cover_wall {
+            let ix = self.wall_index(artist, album);
+            if self.open_album != Some(ix) {
+                self.open_details(ix);
+            }
+            self.scroll_wall_to_album(ix);
+        } else {
+            self.artist_scroll
+                .scroll_to_item(artist, ScrollStrategy::Center);
+            self.album_scroll
+                .scroll_to_item(album, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
     /// Whether the wall has been scrolled down from its very top.
     fn wall_scrolled(&self) -> bool {
         let top = self.wall_list.logical_scroll_top();
@@ -1640,7 +1722,7 @@ impl AuroraApp {
         }
     }
 
-    fn seek_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+    fn seek_to(&mut self, x: Pixels, drag: bool, cx: &mut Context<Self>) {
         let bounds = self.seek_bar_bounds.get();
         let (Ok(audio), Some(track)) = (&self.audio, self.current_track()) else {
             return;
@@ -1654,6 +1736,9 @@ impl AuroraApp {
         let fraction = ((x - bounds.origin.x) / bounds.size.width).clamp(0., 1.);
         let position = audio.position();
         let target = Duration::from_secs_f32(fraction * seconds as f32);
+        if drag && target.as_millis().abs_diff(position.as_millis()) < 150 {
+            return;
+        }
         audio.seek(target);
         self.after_seek(position, target);
         cx.notify();
@@ -1870,6 +1955,14 @@ impl AuroraApp {
             cx.stop_propagation();
             return;
         }
+        if matches!(
+            keystroke.key.as_str(),
+            "left" | "right" | "up" | "down" | "enter"
+        ) && self.handle_navigation_key(keystroke.key.as_str(), modifiers.shift, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let text = match (keystroke.key.as_str(), keystroke.key_char.as_deref()) {
             // Space plays or pauses, unless it is part of a name like "pink floyd".
             ("space", _) if !typing => {
@@ -1892,6 +1985,170 @@ impl AuroraApp {
         self.type_ahead_at = Instant::now();
         self.jump_to_artist(cx);
         cx.stop_propagation();
+    }
+
+    /// Arrow-key and Enter navigation for the cover wall and columns.
+    fn handle_navigation_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.load_state, LoadState::Ready) || self.album_count == 0 {
+            return false;
+        }
+        if self.cover_wall {
+            let current = self
+                .selected_artist
+                .zip(self.selected_album)
+                .map(|(artist, album)| self.wall_index(artist, album))
+                .unwrap_or(0);
+            if self.open_album.is_some() {
+                match key {
+                    "up" => {
+                        self.step_selected_track(-1, cx);
+                        return true;
+                    }
+                    "down" => {
+                        self.step_selected_track(1, cx);
+                        return true;
+                    }
+                    "enter" => {
+                        if !self.tracks.is_empty() {
+                            self.play_from(self.selected_track.unwrap_or(0), cx);
+                        }
+                        return true;
+                    }
+                    "left" => {
+                        if current > 0 {
+                            self.select_wall_album(current - 1, cx);
+                            self.ensure_wall_album_visible(current - 1);
+                            cx.notify();
+                        }
+                        return true;
+                    }
+                    "right" => {
+                        if current + 1 < self.album_count {
+                            self.select_wall_album(current + 1, cx);
+                            self.ensure_wall_album_visible(current + 1);
+                            cx.notify();
+                        }
+                        return true;
+                    }
+                    _ => return false,
+                }
+            }
+            match key {
+                "left" => {
+                    if current > 0 {
+                        self.select_wall_album(current - 1, cx);
+                        self.ensure_wall_album_visible(current - 1);
+                        cx.notify();
+                    }
+                    true
+                }
+                "right" => {
+                    if current + 1 < self.album_count {
+                        self.select_wall_album(current + 1, cx);
+                        self.ensure_wall_album_visible(current + 1);
+                        cx.notify();
+                    }
+                    true
+                }
+                "up" | "down" => {
+                    if let Some(next) = step_wall_vertical(&self.wall_rows, current, key == "down")
+                    {
+                        self.select_wall_album(next, cx);
+                        self.ensure_wall_album_visible(next);
+                        cx.notify();
+                    }
+                    true
+                }
+                "enter" => {
+                    self.select_wall_album(current, cx);
+                    if shift {
+                        if !self.tracks.is_empty() {
+                            self.play_from(0, cx);
+                        }
+                    } else {
+                        self.open_details(current);
+                        if !self.tracks.is_empty() && self.selected_track.is_none() {
+                            self.selected_track = Some(0);
+                        }
+                    }
+                    cx.notify();
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            match key {
+                "up" => {
+                    self.step_selected_track(-1, cx);
+                    true
+                }
+                "down" => {
+                    self.step_selected_track(1, cx);
+                    true
+                }
+                "left" => {
+                    self.step_column_album(-1, cx);
+                    true
+                }
+                "right" => {
+                    self.step_column_album(1, cx);
+                    true
+                }
+                "enter" => {
+                    if !self.tracks.is_empty() {
+                        self.play_from(self.selected_track.unwrap_or(0), cx);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn step_selected_track(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        let next = match self.selected_track {
+            None => 0,
+            Some(ix) => ix
+                .saturating_add_signed(delta)
+                .min(self.tracks.len().saturating_sub(1)),
+        };
+        self.selected_track = Some(next);
+        self.track_scroll
+            .scroll_to_item(next, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn step_column_album(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.artists.is_empty() {
+            return;
+        }
+        let (artist, album) = self.selected_artist.zip(self.selected_album).unwrap_or((0, 0));
+        let (next_artist, next_album) = if delta > 0 {
+            if album + 1 < self.artists[artist].albums.len() {
+                (artist, album + 1)
+            } else if artist + 1 < self.artists.len() {
+                (artist + 1, 0)
+            } else {
+                return;
+            }
+        } else if album > 0 {
+            (artist, album - 1)
+        } else if artist > 0 {
+            let prev_artist = artist - 1;
+            let last_album = self.artists[prev_artist].albums.len().saturating_sub(1);
+            (prev_artist, last_album)
+        } else {
+            return;
+        };
+        self.selected_artist = Some(next_artist);
+        self.select_album(next_album, cx);
+        self.artist_scroll
+            .scroll_to_item(next_artist, ScrollStrategy::Center);
+        self.album_scroll
+            .scroll_to_item(next_album, ScrollStrategy::Center);
     }
 
     // ── Ratings ─────────────────────────────────────────────────────────
@@ -3295,15 +3552,35 @@ impl AuroraApp {
                 .child(self.love_control("playing-love", track, cx))
                 .child(
                     div()
-                        .flex_none()
-                        .max_w(relative(0.6))
-                        .truncate()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(track.title.clone()),
-                )
-                .child(
-                    truncated(format!("{} · {}", track.artist, self.queue_album))
-                        .text_color(rgb(color::MUTED)),
+                        .id("jump-to-playing")
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .group("playing-link")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.jump_to_playing_album(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(relative(0.6))
+                                .truncate()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .group_hover("playing-link", |style| {
+                                    style.text_color(rgb(color::ACCENT))
+                                })
+                                .child(track.title.clone()),
+                        )
+                        .child(
+                            truncated(format!("{} · {}", track.artist, self.queue_album))
+                                .text_color(rgb(color::MUTED))
+                                .group_hover("playing-link", |style| {
+                                    style.text_color(rgb(color::TEXT))
+                                }),
+                        ),
                 ),
             (None, None, _) => div()
                 .text_color(rgb(color::MUTED))
@@ -3334,7 +3611,10 @@ impl AuroraApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.seek_to(event.position.x, cx);
+                    if this.current_track().is_some() {
+                        this.dragging_seek = true;
+                        this.seek_to(event.position.x, false, cx);
+                    }
                 }),
             )
             // Remembers where the bar is on screen, so a click can be turned
@@ -3499,7 +3779,7 @@ impl Render for AuroraApp {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::focus_search))
-            // The size slider keeps following the mouse while the button is held.
+            // The size slider and seek bar keep following the mouse while held.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.dragging_size {
                     if event.pressed_button == Some(MouseButton::Left) {
@@ -3509,12 +3789,21 @@ impl Render for AuroraApp {
                         cx.notify();
                     }
                 }
+                if this.dragging_seek {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.seek_to(event.position.x, true, cx);
+                    } else {
+                        this.dragging_seek = false;
+                        cx.notify();
+                    }
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.dragging_size {
+                    if this.dragging_size || this.dragging_seek {
                         this.dragging_size = false;
+                        this.dragging_seek = false;
                         cx.notify();
                     }
                 }),
@@ -4035,9 +4324,52 @@ fn step_history_next(
     }
 }
 
+/// Moves up or down one cover row on the cover wall, skipping group headers
+/// and keeping the same column (clamped to the target row's width).
+fn step_wall_vertical(rows: &[WallRow], current: usize, down: bool) -> Option<usize> {
+    let (row_ix, col) = rows.iter().enumerate().find_map(|(ix, row)| match *row {
+        WallRow::Covers { start, end } if current >= start && current < end => {
+            Some((ix, current - start))
+        }
+        _ => None,
+    })?;
+    let target = if down {
+        rows.iter().skip(row_ix + 1).find_map(|row| match *row {
+            WallRow::Covers { start, end } if end > start => Some((start, end)),
+            _ => None,
+        })
+    } else {
+        rows.iter().take(row_ix).rev().find_map(|row| match *row {
+            WallRow::Covers { start, end } if end > start => Some((start, end)),
+            _ => None,
+        })
+    }?;
+    Some((target.0 + col).min(target.1 - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_vertically_across_grouped_cover_rows() {
+        let rows = [
+            WallRow::Header { group: 0 },
+            WallRow::Covers { start: 0, end: 4 },
+            WallRow::Covers { start: 4, end: 6 },
+            WallRow::Header { group: 1 },
+            WallRow::Covers { start: 6, end: 10 },
+        ];
+        // Column 3 drops onto the shorter row's last cover (5).
+        assert_eq!(step_wall_vertical(&rows, 3, true), Some(5));
+        // Stepping down across a group header lands in the next group's covers.
+        assert_eq!(step_wall_vertical(&rows, 5, true), Some(7));
+        // Stepping up from the first row or down from the last does nothing.
+        assert_eq!(step_wall_vertical(&rows, 1, false), None);
+        assert_eq!(step_wall_vertical(&rows, 8, true), None);
+        // Stepping up across a group header clamps to the shorter row above.
+        assert_eq!(step_wall_vertical(&rows, 9, false), Some(5));
+    }
 
     #[test]
     fn steps_through_search_history_and_restores_draft() {

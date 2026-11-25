@@ -2,6 +2,14 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.30.0] - 2026-11-25
+
+### Added
+
+- **Keyboard-first navigation from search to playback**: pressing **Enter** in the search box moves focus to the library (except with `sort:random`, where **Enter** still reshuffles). Use **Arrow** keys to move across covers (including across group headers), albums and tracks; press **Enter** to open an album's details or play the selected track, or **Shift+Enter** to play a cover right away.
+- **Jump to playing album**: click the playing track's title, artist or album in the now-playing bar to scroll straight back to that album and open its details, clearing an active search filter if the album is hidden by it.
+- **Drag-to-scrub seek bar**: hold and drag along the waveform seek bar to scrub smoothly through the playing track.
+
 ## [0.29.0] - 2026-11-25
 
 ### Added
