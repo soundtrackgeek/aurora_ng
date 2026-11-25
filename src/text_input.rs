@@ -30,6 +30,9 @@ actions!(
         Copy,
         Submit,
         Cancel,
+        Up,
+        Down,
+        Tab,
     ]
 );
 
@@ -54,6 +57,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
         KeyBinding::new("enter", Submit, Some(CONTEXT)),
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+        KeyBinding::new("up", Up, Some(CONTEXT)),
+        KeyBinding::new("down", Down, Some(CONTEXT)),
+        KeyBinding::new("tab", Tab, Some(CONTEXT)),
     ]);
 }
 
@@ -64,6 +70,12 @@ pub enum InputEvent {
     Submit,
     /// Esc.
     Cancel,
+    /// Up arrow: recall an older entry.
+    HistoryPrevious,
+    /// Down arrow: move toward newer entries or back to the draft.
+    HistoryNext,
+    /// Tab: accept the top completion.
+    Complete,
 }
 
 pub struct TextInput {
@@ -206,6 +218,18 @@ impl TextInput {
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(InputEvent::Cancel);
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::HistoryPrevious);
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::HistoryNext);
+    }
+
+    fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::Complete);
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -666,6 +690,9 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::tab))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

@@ -2,6 +2,13 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.29.0] - 2026-11-25
+
+### Added
+
+- **Search history**: the last 20 searches are remembered in `settings.json`. Press **Up** and **Down** in the search box to cycle through recent queries (restoring any draft you were typing when you return to the bottom), or click a recent query in the **Syntax** panel to run it right away.
+- **Tab completion**: press **Tab** in the search box to accept the first completion for the current field or value, highlighted in the **Syntax** panel.
+
 ## [0.28.3] - 2026-11-24
 
 ### Fixed

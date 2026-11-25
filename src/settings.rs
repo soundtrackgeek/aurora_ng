@@ -9,6 +9,8 @@ use std::{fs, path::PathBuf};
 
 /// The cover size on first start.
 pub const DEFAULT_COVER_SIZE: f32 = 500.;
+/// How many recent search queries to remember.
+pub const MAX_SEARCH_HISTORY: usize = 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -24,11 +26,25 @@ pub struct Settings {
     pub track_id: Option<i64>,
     /// The search the albums were filtered by; empty for none.
     pub search: String,
+    /// Recent searches, newest first.
+    pub search_history: Vec<String>,
     /// The draw `sort:random` showed, so it comes back the same.
     pub shuffle_seed: Option<u64>,
     pub window: Option<SavedWindow>,
     /// What colours the waveform in the seek bar.
     pub seek_bar_colour: SeekBarColour,
+}
+
+/// Records `query` at the front of `history`, deduplicating and capping its
+/// length. Blank queries are ignored.
+pub fn record_search_history(history: &mut Vec<String>, query: &str) {
+    let query = query.trim();
+    if query.is_empty() {
+        return;
+    }
+    history.retain(|entry| entry != query);
+    history.insert(0, query.to_owned());
+    history.truncate(MAX_SEARCH_HISTORY);
 }
 
 /// What the seek bar's waveform is coloured by, from Music Library's
@@ -72,6 +88,7 @@ impl Default for Settings {
             details_open: false,
             track_id: None,
             search: String::new(),
+            search_history: Vec::new(),
             shuffle_seed: None,
             window: None,
             seek_bar_colour: SeekBarColour::default(),
@@ -138,6 +155,10 @@ mod tests {
             details_open: true,
             track_id: Some(7),
             search: "aartist:\"bon jovi\" sort:random".to_owned(),
+            search_history: vec![
+                "aartist:\"bon jovi\" sort:random".to_owned(),
+                "genre:scores".to_owned(),
+            ],
             shuffle_seed: Some(42),
             window: Some(SavedWindow {
                 x: 10.,
@@ -158,7 +179,27 @@ mod tests {
         assert_eq!(settings.cover_size, 300.);
         assert!(settings.cover_wall);
         assert_eq!(settings.album_id, None);
+        assert!(settings.search_history.is_empty());
         assert_eq!(settings.seek_bar_colour, SeekBarColour::Brightness);
+    }
+
+    #[test]
+    fn records_search_history_newest_first_without_duplicates() {
+        let mut history = Vec::new();
+        record_search_history(&mut history, "   ");
+        assert!(history.is_empty());
+
+        record_search_history(&mut history, "genre:scores");
+        record_search_history(&mut history, " year:1985 ");
+        record_search_history(&mut history, "genre:scores");
+        assert_eq!(history, vec!["genre:scores", "year:1985"]);
+
+        for i in 0..25 {
+            record_search_history(&mut history, &format!("year:{}", 1980 + i));
+        }
+        assert_eq!(history.len(), MAX_SEARCH_HISTORY);
+        assert_eq!(history[0], "year:2004");
+        assert_eq!(history[MAX_SEARCH_HISTORY - 1], "year:1985");
     }
 
     #[test]

@@ -242,6 +242,13 @@ pub struct AuroraApp {
     search_input: Entity<TextInput>,
     search_help_open: bool,
     search_values: search_help::CatalogValues,
+    /// Recent searches, newest first.
+    search_history: Vec<String>,
+    /// Position in `search_history` while stepping with Up/Down; `None` when
+    /// editing live text.
+    search_history_index: Option<usize>,
+    /// Text typed before stepping into `search_history`, restored on Down.
+    search_draft: String,
     /// The query the shown albums match; `None` shows the whole library.
     search: Option<String>,
     search_state: SearchState,
@@ -467,6 +474,9 @@ impl AuroraApp {
             search_input,
             search_help_open: false,
             search_values: search_help::CatalogValues::default(),
+            search_history: settings.search_history.clone(),
+            search_history_index: None,
+            search_draft: String::new(),
             search: None,
             search_state: SearchState::Idle,
             search_task: None,
@@ -655,6 +665,7 @@ impl AuroraApp {
                 LoadState::Ready => self.search.clone().unwrap_or_default(),
                 _ => self.restore.search.clone(),
             },
+            search_history: self.search_history.clone(),
             shuffle_seed: Some(self.shuffle_seed),
             window,
             seek_bar_colour: self.seek_bar_colour,
@@ -671,9 +682,15 @@ impl AuroraApp {
         cx: &mut Context<Self>,
     ) {
         match event {
-            InputEvent::Changed => self.schedule_search(cx),
+            InputEvent::Changed => {
+                self.search_history_index = None;
+                self.search_draft.clear();
+                self.schedule_search(cx);
+            }
             InputEvent::Submit => {
                 self.search_help_open = false;
+                self.search_history_index = None;
+                self.search_draft.clear();
                 // Enter on a random sort that is already shown draws again.
                 if !self.run_search(cx) && self.sort == Some(search::Sort::Random) {
                     self.reshuffle(cx);
@@ -686,9 +703,50 @@ impl AuroraApp {
                 } else if self.search_text(cx).is_empty() {
                     window.focus(&self.focus_handle);
                 } else {
+                    self.search_history_index = None;
+                    self.search_draft.clear();
                     self.search_input
                         .update(cx, |input, cx| input.set_text("", cx));
                     self.run_search(cx);
+                }
+            }
+            InputEvent::HistoryPrevious => {
+                let current = self.search_text(cx);
+                if let Some(next_text) = step_history_previous(
+                    &self.search_history,
+                    &mut self.search_history_index,
+                    &mut self.search_draft,
+                    &current,
+                ) {
+                    self.search_input
+                        .update(cx, |input, cx| input.set_text(next_text, cx));
+                    self.schedule_search(cx);
+                }
+            }
+            InputEvent::HistoryNext => {
+                if let Some(next_text) = step_history_next(
+                    &self.search_history,
+                    &mut self.search_history_index,
+                    &mut self.search_draft,
+                ) {
+                    self.search_input
+                        .update(cx, |input, cx| input.set_text(next_text, cx));
+                    self.schedule_search(cx);
+                }
+            }
+            InputEvent::Complete => {
+                let current = self.search_text(cx);
+                if let Some((_, completed)) =
+                    search_help::suggestions(&current, &self.search_values)
+                        .into_iter()
+                        .next()
+                    && completed != current
+                {
+                    self.search_history_index = None;
+                    self.search_draft.clear();
+                    self.search_input
+                        .update(cx, |input, cx| input.set_text(completed, cx));
+                    self.schedule_search(cx);
                 }
             }
         }
@@ -758,6 +816,9 @@ impl AuroraApp {
         if parsed.is_empty() && !wants_sound {
             // Nothing to filter, though there may be a sort or group.
             self.search_state = SearchState::Idle;
+            if !query.is_empty() {
+                settings::record_search_history(&mut self.search_history, &query);
+            }
             self.search = (!query.is_empty()).then_some(query);
             self.sort = view.sort;
             self.group = view.group;
@@ -820,6 +881,7 @@ impl AuroraApp {
                     }
                 }
                 self.search_state = SearchState::Idle;
+                settings::record_search_history(&mut self.search_history, &query);
                 self.search = Some(query);
                 self.sort = view.sort;
                 self.group = view.group;
@@ -831,6 +893,8 @@ impl AuroraApp {
     }
 
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_history_index = None;
+        self.search_draft.clear();
         self.search_input
             .update(cx, |input, cx| input.set_text("", cx));
         self.run_search(cx);
@@ -2324,6 +2388,7 @@ impl AuroraApp {
     fn render_search_help(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search_input.read(cx).text();
         let completions = search_help::suggestions(query, &self.search_values);
+        let recent: Vec<String> = self.search_history.iter().take(8).cloned().collect();
         div()
             .id("search-help")
             .max_h(px(260.))
@@ -2337,7 +2402,7 @@ impl AuroraApp {
             .border_b_1()
             .border_color(rgb(color::BORDER))
             .child("Use AND or a comma to combine, OR for alternatives, and NOT to exclude. Quotes match a full value. Enter searches now.")
-            .child(muted("Use : or = after a field. Ranges use .. and include both ends."))
+            .child(muted("Use : or = after a field. Ranges use .. and include both ends. Tab completes; Up/Down recalls recent searches."))
             .when_some(match &self.search_state {
                 SearchState::Failed(error) => Some(error),
                 _ => None,
@@ -2345,15 +2410,48 @@ impl AuroraApp {
             .when(!completions.is_empty(), |panel| {
                 panel.child(div().flex().flex_wrap().gap_2().children(
                     completions.into_iter().enumerate().map(|(index, (label, query))| {
-                        text_button(("search-completion", index), label, false).on_click(
-                            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.search_input.update(cx, |input, cx| input.set_text(query.clone(), cx));
+                        text_button(("search-completion", index), label, false)
+                            .when(index == 0, |button| {
+                                button.border_color(rgb(color::ACCENT))
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.search_history_index = None;
+                                this.search_draft.clear();
+                                this.search_input
+                                    .update(cx, |input, cx| input.set_text(query.clone(), cx));
                                 window.focus(&this.search_input.focus_handle(cx));
                                 this.schedule_search(cx);
-                            }),
-                        )
+                            }))
                     }),
                 ))
+            })
+            .when(!recent.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(muted("Recent:"))
+                        .children(recent.into_iter().enumerate().map(|(index, query)| {
+                            let label = query.clone();
+                            text_button(("search-recent", index), label, false)
+                                .max_w(px(320.))
+                                .truncate()
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.search_help_open = false;
+                                        this.search_history_index = None;
+                                        this.search_draft.clear();
+                                        this.search_input.update(cx, |input, cx| {
+                                            input.set_text(query.clone(), cx)
+                                        });
+                                        window.focus(&this.search_input.focus_handle(cx));
+                                        this.run_search(cx);
+                                    },
+                                ))
+                        })),
+                )
             })
             .child(div().flex().flex_wrap().gap_x_4().gap_y_1().children(
                 search_help::fields().map(|(name, label, example)| {
@@ -3886,9 +3984,114 @@ fn thousands(value: usize) -> String {
     out
 }
 
+/// Steps backward (older) through `history`, saving `current` as the draft on
+/// the first step. If the newest entry already matches `current`, skips to the
+/// next older one so pressing Up immediately changes the box.
+fn step_history_previous(
+    history: &[String],
+    index: &mut Option<usize>,
+    draft: &mut String,
+    current: &str,
+) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+    let next = match *index {
+        None => {
+            *draft = current.to_owned();
+            if history[0] == current.trim() && history.len() > 1 {
+                1
+            } else {
+                0
+            }
+        }
+        Some(ix) => {
+            let next = (ix + 1).min(history.len() - 1);
+            if next == ix {
+                return None;
+            }
+            next
+        }
+    };
+    *index = Some(next);
+    Some(history[next].clone())
+}
+
+/// Steps forward (newer) through `history`, restoring `draft` past the newest
+/// entry.
+fn step_history_next(
+    history: &[String],
+    index: &mut Option<usize>,
+    draft: &mut String,
+) -> Option<String> {
+    let ix = (*index)?;
+    if ix > 0 {
+        let next = ix - 1;
+        *index = Some(next);
+        Some(history[next].clone())
+    } else {
+        *index = None;
+        Some(std::mem::take(draft))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_through_search_history_and_restores_draft() {
+        let history = vec![
+            "genre:scores".to_owned(),
+            "year:1985".to_owned(),
+            "sound:synth".to_owned(),
+        ];
+        let mut index = None;
+        let mut draft = String::new();
+
+        // Starting from a typed draft visits index 0 first.
+        assert_eq!(
+            step_history_previous(&history, &mut index, &mut draft, "aartist:bo").as_deref(),
+            Some("genre:scores")
+        );
+        assert_eq!(index, Some(0));
+        assert_eq!(
+            step_history_previous(&history, &mut index, &mut draft, "genre:scores").as_deref(),
+            Some("year:1985")
+        );
+        assert_eq!(
+            step_history_previous(&history, &mut index, &mut draft, "year:1985").as_deref(),
+            Some("sound:synth")
+        );
+        // At the oldest entry, Up is a no-op.
+        assert_eq!(
+            step_history_previous(&history, &mut index, &mut draft, "sound:synth"),
+            None
+        );
+
+        // Down walks back toward newer entries and restores the draft.
+        assert_eq!(
+            step_history_next(&history, &mut index, &mut draft).as_deref(),
+            Some("year:1985")
+        );
+        assert_eq!(
+            step_history_next(&history, &mut index, &mut draft).as_deref(),
+            Some("genre:scores")
+        );
+        assert_eq!(
+            step_history_next(&history, &mut index, &mut draft).as_deref(),
+            Some("aartist:bo")
+        );
+        assert_eq!(index, None);
+        assert_eq!(step_history_next(&history, &mut index, &mut draft), None);
+
+        // When the current box already holds history[0], Up jumps straight to history[1].
+        assert_eq!(
+            step_history_previous(&history, &mut index, &mut draft, "genre:scores").as_deref(),
+            Some("year:1985")
+        );
+        assert_eq!(index, Some(1));
+    }
 
     #[test]
     fn ramps_through_three_colours_like_aurora() {
