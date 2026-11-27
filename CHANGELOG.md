@@ -2,6 +2,16 @@
 
 All notable changes to Aurora NG are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.31.0] - 2026-11-27
+
+### Added
+
+- **Search and sort by Rank**, as in Aurora 0.81.0: `rank:` finds the Rank on the album card, provisional ranks included, and `frank:` final ranks only, once every track is rated, such as `frank:1`, `rank:..3` or `frank:1 AND genre:scores`. `sort:rank` and `sort:frank` put every year's #1 albums first, from every pool, then the #2s, with the higher Album Score first among equal ranks; `sort:..rank` and `sort:..frank` reverse it. Albums without a Rank go last.
+
+### Fixed
+
+- The **Syntax** panel shows "Album artist’s origin", "varèse" and "0–5" instead of garbled characters.
+
 ## [0.30.0] - 2026-11-25
 
 ### Added

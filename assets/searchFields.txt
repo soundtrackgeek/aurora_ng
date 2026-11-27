@@ -6,10 +6,12 @@ genre|Genre|genre:scores
 genres|Number of genre tags|genres:2..|sat
 year|Original year|year:1980..1989
 ryear|Release year|ryear:2004
-publisher|Publisher or label|publisher:varÃ¨se
-country|Album artistâ€™s origin|country:norway
+publisher|Publisher or label|publisher:varèse
+country|Album artist’s origin|country:norway
 cr|Rating completeness (%)|cr:50..80
 love|Loved tracks|love:1..3
+rank|Album Rank in its year|rank:..3
+frank|Final album Rank (fully rated)|frank:1
 single|Official singles|single:1
 sonic|Saved sonic analysis|sonic:yes|sat
 sound|Sound descriptor|sound:choir
@@ -17,7 +19,7 @@ vibe|Describe a sound|vibe:"dark ambient drone"
 sort|Result order|sort:az
 group|Group results|group:genre|san
 minutes|Duration in minutes|minutes:33..44
-ar|Album rating (0â€“5)|ar:3..4
+ar|Album rating (0–5)|ar:3..4
 born|Birth year|born:1966
 dead|Death year or status|dead:no
 founded|Band start year|founded:1990..

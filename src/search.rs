@@ -48,6 +48,11 @@ enum Extended {
     Born,
     Minutes,
     AlbumRating,
+    /// `rank:`: the Rank on the album card, among the fully rated albums of
+    /// its year and pool (see `library::assign_ranks`), provisional or final.
+    Rank,
+    /// `frank:`: only a final Rank, once every track is rated.
+    FinalRank,
     Billboard,
     Uk,
     Vg,
@@ -118,6 +123,8 @@ impl Field {
             "born" => Self::Extended(Extended::Born),
             "minutes" => Self::Extended(Extended::Minutes),
             "ar" => Self::Extended(Extended::AlbumRating),
+            "rank" => Self::Extended(Extended::Rank),
+            "frank" => Self::Extended(Extended::FinalRank),
             "bb" => Self::Extended(Extended::Billboard),
             "uk" => Self::Extended(Extended::Uk),
             "vg" => Self::Extended(Extended::Vg),
@@ -740,6 +747,17 @@ pub enum Sort {
     AlbumArtist {
         descending: bool,
     },
+    /// The Rank on the album card, 1 first (`sort:rank`), or last first
+    /// (`sort:..rank`); equal ranks by Album Score, highest first. Albums
+    /// without a Rank go last either way.
+    Rank {
+        descending: bool,
+    },
+    /// The same with final ranks only (`sort:frank`): albums still being
+    /// rated go last with the unranked ones.
+    FinalRank {
+        descending: bool,
+    },
     /// Best fit to the search's first `vibe:` description first.
     Vibe,
 }
@@ -788,7 +806,7 @@ pub struct View {
     pub group: Option<WallGrouping>,
 }
 
-const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:az, sort:za, sort:album az, sort:aartist za or sort:vibe.";
+const SORT_HELP: &str = "Use sort:random, sort:year.., sort:..year, sort:rank, sort:frank, sort:..rank, sort:az, sort:za, sort:album az, sort:aartist za or sort:vibe.";
 const GROUP_HELP: &str = "Use group:genre, group:aartist, group:publisher, group:country, group:year, group:decade, group:love, group:ar or group:sound.";
 
 fn parse_sort(value: &str, descending: bool) -> Result<Sort, String> {
@@ -797,6 +815,10 @@ fn parse_sort(value: &str, descending: bool) -> Result<Sort, String> {
         "vibe" => Sort::Vibe,
         "year.." => Sort::YearAscending,
         "..year" => Sort::YearDescending,
+        "rank" | "rank.." => Sort::Rank { descending: false },
+        "..rank" => Sort::Rank { descending: true },
+        "frank" | "frank.." => Sort::FinalRank { descending: false },
+        "..frank" => Sort::FinalRank { descending: true },
         "az" => Sort::Album { descending: false },
         "za" => Sort::Album { descending: true },
         "album" | "albums" => Sort::Album { descending },
@@ -963,6 +985,22 @@ pub fn wall_order(artists: &[crate::library::Artist], sort: Sort, seed: u64) -> 
         Sort::AlbumArtist { descending: false } => {}
         Sort::AlbumArtist { descending: true } => {
             order.sort_by(|&a, &b| albums[b].0.cmp(albums[a].0));
+        }
+        Sort::Rank { descending } | Sort::FinalRank { descending } => {
+            let final_only = matches!(sort, Sort::FinalRank { .. });
+            let rank = |album: &crate::library::Album| {
+                album
+                    .rank
+                    .filter(|_| !final_only || album.is_fully_rated())
+                    .map(|rank| (rank, album.score.unwrap_or_default()))
+            };
+            order.sort_by(|&a, &b| match (rank(albums[a].1), rank(albums[b].1)) {
+                (Some((rank_a, score_a)), Some((rank_b, score_b))) => {
+                    let order = rank_a.cmp(&rank_b).then(score_b.total_cmp(&score_a));
+                    if descending { order.reverse() } else { order }
+                }
+                (a, b) => b.is_some().cmp(&a.is_some()),
+            });
         }
         // Best fit first; albums without a score last.
         Sort::Vibe => order.sort_by(|&a, &b| albums[b].1.vibe.cmp(&albums[a].1.vibe)),
@@ -1345,7 +1383,12 @@ fn album_predicate(
 }
 
 /// Artist lifespans, length, album rating and chart ranks.
-fn extended_predicate(alias: &str, matcher: &Match, params: &mut Vec<Value>) -> Option<String> {
+fn extended_predicate(
+    alias: &str,
+    matcher: &Match,
+    tables: Tables,
+    params: &mut Vec<Value>,
+) -> Option<String> {
     use Extended::*;
     let Match::Extended {
         field,
@@ -1413,6 +1456,23 @@ fn extended_predicate(alias: &str, matcher: &Match, params: &mut Vec<Value>) -> 
             exists
         });
     }
+    if matches!(field, Rank | FinalRank) {
+        // Older catalogs have no `rated_tracks`: nothing is ranked against, so
+        // no album has a Rank.
+        if !tables.rated_tracks {
+            return Some("0".to_owned());
+        }
+        let rank = if *field == Rank {
+            "ranked.album_rank"
+        } else {
+            "ranked.final_rank"
+        };
+        let condition = range_sql(rank, *from, *to, real, params);
+        return Some(format!(
+            "{alias}.id IN (SELECT ranked.album_id FROM ({}) AS ranked WHERE {condition})",
+            ranks_sql()
+        ));
+    }
     // Songs-only charts have no album ranks.
     if matches!(field, Ti | Nt) {
         return Some("0".to_owned());
@@ -1448,6 +1508,37 @@ struct Tables {
     singles: bool,
     /// Aurora's sound descriptors, attached as `sound`.
     sound: bool,
+    /// `albums.rated_tracks`, which makes a Rank final.
+    rated_tracks: bool,
+}
+
+/// `album_id`, `album_rank` and `final_rank` for every album with an Album
+/// Score and a year, as `library::assign_ranks` gives them: `album_rank` is one
+/// more than the fully rated albums of its year and pool with a higher score
+/// (none when its pool has no fully rated album yet), and `final_rank` the same
+/// once every track is rated. Equal scores share a rank (1, 2, 2, 4).
+fn ranks_sql() -> String {
+    let scores = SCORE_GENRES
+        .iter()
+        .map(|genre| format!("'{genre}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // EXCLUDE GROUP leaves out the album and its equal scores: the fully rated
+    // albums that remain all score higher.
+    format!(
+        "SELECT album_id, album_rank, CASE WHEN complete THEN album_rank END AS final_rank \
+         FROM (SELECT album_id, complete, \
+             CASE WHEN SUM(complete) OVER (PARTITION BY year, pool) > 0 \
+               THEN 1 + COALESCE(SUM(complete) OVER (PARTITION BY year, pool ORDER BY album_score DESC \
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP), 0) END AS album_rank \
+           FROM (SELECT ranked_album.id AS album_id, ranked_album.year AS year, \
+               ranked_album.album_score AS album_score, \
+               COALESCE(ranked_album.total_tracks > 0 AND ranked_album.rated_tracks >= ranked_album.total_tracks, 0) AS complete, \
+               CASE lower(trim(COALESCE(ranked_album.canonical_genre, ''))) WHEN 'soundtrack' THEN 2 \
+                    ELSE CASE WHEN lower(trim(COALESCE(ranked_album.canonical_genre, ''))) IN ({scores}) THEN 1 ELSE 0 END END AS pool \
+             FROM albums AS ranked_album \
+             WHERE ranked_album.year IS NOT NULL AND ranked_album.album_score IS NOT NULL))"
+    )
 }
 
 /// Appends ` AND (…)` for every group, testing albums aliased `a`.
@@ -1520,12 +1611,9 @@ fn push_album_predicates(
                 album_predicate("a", &alternative.matcher, tables, params)
             }),
         );
-        alternatives.extend(
-            group
-                .alternatives
-                .iter()
-                .filter_map(|alternative| extended_predicate("a", &alternative.matcher, params)),
-        );
+        alternatives.extend(group.alternatives.iter().filter_map(|alternative| {
+            extended_predicate("a", &alternative.matcher, tables, params)
+        }));
 
         sql.push_str(if group.negated {
             " AND NOT ("
@@ -1546,9 +1634,17 @@ pub fn album_ids(connection: &Connection, search: &Search) -> Result<HashSet<Str
             |row| row.get(0),
         )
         .map_err(|error| format!("Could not search: {error}"))?;
+    let rated_tracks: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('albums') WHERE name = 'rated_tracks')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not search: {error}"))?;
     let tables = Tables {
         singles,
         sound: crate::sound::attached(connection)?,
+        rated_tracks,
     };
     // Score each description once, before SQLite asks album by album.
     let vibes = search
@@ -1578,6 +1674,28 @@ mod tests {
 
     #[test]
     fn takes_the_sort_out_of_a_query() {
+        for (query, descending) in [
+            ("sort:rank", false),
+            ("sort:rank..", false),
+            ("sort:..rank", true),
+        ] {
+            assert_eq!(
+                split_view(query).unwrap().1.sort,
+                Some(Sort::Rank { descending }),
+                "{query}"
+            );
+        }
+        for (query, descending) in [
+            ("sort:frank", false),
+            ("sort:frank..", false),
+            ("sort:..frank", true),
+        ] {
+            assert_eq!(
+                split_view(query).unwrap().1.sort,
+                Some(Sort::FinalRank { descending }),
+                "{query}"
+            );
+        }
         let split = |query: &str| {
             let (rest, view) = split_view(query).unwrap();
             assert_eq!(view.group, None);
@@ -1749,6 +1867,114 @@ mod tests {
         );
         shuffled.sort();
         assert_eq!(shuffled, [0, 1, 2, 3]);
+
+        // sort:rank: final ranks only, 1 first, the higher Album Score first among
+        // equal ranks; provisional and missing ranks last, in wall order.
+        let mut ranked = artists.clone();
+        let mut set = |artist: usize, album: usize, rank: u32, score: f64, rated: i64| {
+            let album = &mut ranked[artist].albums[album];
+            album.rank = Some(rank);
+            album.score = Some(score);
+            album.total_tracks = Some(10);
+            album.rated_tracks = Some(rated);
+        };
+        set(0, 0, 2, 40.0, 10);
+        set(0, 1, 1, 30.0, 10);
+        set(1, 0, 1, 90.0, 10);
+        // Still being rated: its Rank 1 is provisional.
+        set(1, 1, 1, 99.0, 9);
+        let order = |sort| wall_order(&ranked, sort, 7);
+        assert_eq!(order(Sort::FinalRank { descending: false }), [2, 1, 0, 3]);
+        assert_eq!(order(Sort::FinalRank { descending: true }), [0, 1, 2, 3]);
+        // sort:rank counts the provisional Rank 1 too, with the highest score.
+        assert_eq!(order(Sort::Rank { descending: false }), [3, 2, 1, 0]);
+        assert_eq!(order(Sort::Rank { descending: true }), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn finds_final_ranks_in_each_pool() {
+        let connection = catalog();
+        // Without `rated_tracks` no Rank is final, so nothing matches.
+        assert!(ids(&connection, "rank:1..").is_empty());
+        connection
+            .execute_batch(
+                "ALTER TABLE albums ADD COLUMN album_score REAL;
+                 ALTER TABLE albums ADD COLUMN total_tracks INTEGER;
+                 ALTER TABLE albums ADD COLUMN rated_tracks INTEGER;
+                 UPDATE albums SET total_tracks = 10, rated_tracks = 10;
+                 INSERT INTO albums (id, album, album_artist_display, canonical_genre, year,
+                     total_tracks, rated_tracks, album_score)
+                 VALUES ('rival', 'rival', 'Kim Wilde', 'Synthpop', 1984, 10, 10, 80),
+                        ('drama', 'drama', 'Hans Zimmer', 'Drama', 1984, 10, 10, 5),
+                        ('ost', 'ost', 'Vangelis', 'Soundtrack', 1984, 10, 10, 1),
+                        ('partial', 'partial', 'Kim Wilde', 'Synthpop', 1984, 10, 9, 500);
+                 UPDATE albums SET album_score = 50 WHERE id = 'synth';",
+            )
+            .unwrap();
+        let in_1984 = |mut found: Vec<String>| {
+            found.retain(|id| ["rival", "drama", "ost", "synth", "partial"].contains(&id.as_str()));
+            found
+        };
+        // 1984: rival beats synth in the general pool; the score and the
+        // soundtrack top their own pools; the partly rated album is not final.
+        assert_eq!(
+            in_1984(ids(&connection, "frank:1")),
+            ["drama", "ost", "rival"]
+        );
+        assert_eq!(ids(&connection, "frank:2"), ["synth"]);
+        assert_eq!(ids(&connection, "frank:2.."), ["synth"]);
+        assert!(!ids(&connection, "NOT frank:1..").contains(&"synth".to_owned()));
+        assert!(ids(&connection, "NOT frank:1..").contains(&"partial".to_owned()));
+        // rank: is the card's Rank: the partly rated album outscores rival
+        // without pushing it down.
+        assert_eq!(
+            in_1984(ids(&connection, "rank:1")),
+            ["drama", "ost", "partial", "rival"]
+        );
+        assert_eq!(ids(&connection, "rank:2"), ["synth"]);
+        // Every album's rank: agrees with the Rank `assign_ranks` puts on its card.
+        let mut statement = connection
+            .prepare("SELECT id, year, canonical_genre, album_score, total_tracks, rated_tracks FROM albums")
+            .unwrap();
+        let albums = statement
+            .query_map([], |row| {
+                Ok(crate::library::Album {
+                    id: row.get(0)?,
+                    title: String::new(),
+                    year: row.get(1)?,
+                    publisher: None,
+                    genre: row.get(2)?,
+                    total_tracks: row.get(4)?,
+                    rated_tracks: row.get(5)?,
+                    total_seconds: None,
+                    rating: None,
+                    score: row.get(3)?,
+                    rank: None,
+                    loved_tracks: None,
+                    cover: None,
+                    charts: Vec::new(),
+                    sound: None,
+                    vibe: None,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut artists = [crate::library::Artist {
+            name: String::new(),
+            sort_key: String::new(),
+            flag: None,
+            country: None,
+            albums,
+        }];
+        crate::library::assign_ranks(&mut artists);
+        for album in &artists[0].albums {
+            let found = |query: &str| ids(&connection, query).contains(&album.id);
+            match album.rank {
+                Some(rank) => assert!(found(&format!("rank:{rank}")), "{}", album.id),
+                None => assert!(!found("rank:1.."), "{}", album.id),
+            }
+        }
     }
 
     #[test]
